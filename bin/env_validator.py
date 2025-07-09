@@ -352,7 +352,7 @@ class EnvironmentValidator:
 
         return variables
 
-        def validate(self) -> Dict[str, Any]:
+    def validate(self) -> Dict[str, Any]:
         """Validate all environment variables"""
         print(f"\n{'='*60}")
         print(f"RAD Monitor Environment Validation")

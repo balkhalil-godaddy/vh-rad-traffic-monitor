@@ -50,8 +50,14 @@ export class AuthService {
                 }
             }
 
-            // Check for stored cookie first
-            const storedCookie = localStorage.getItem('elastic_cookie');
+            // Check for stored cookie first - use centralized auth if available
+            let storedCookie = null;
+            if (window.CentralizedAuth) {
+                storedCookie = window.CentralizedAuth.getCookie();
+            } else {
+                // Fallback to legacy storage
+                storedCookie = localStorage.getItem('elastic_cookie');
+            }
             
             // Try backend auth check with cookie
             const headers = {
@@ -116,6 +122,12 @@ export class AuthService {
      * @returns {string|null} Cookie value or null
      */
     _getLegacyCookie() {
+        // Use centralized auth if available
+        if (window.CentralizedAuth) {
+            return window.CentralizedAuth.getCookie();
+        }
+
+        // Fallback to legacy storage
         try {
             const saved = localStorage.getItem('elasticCookie');
             if (saved) {
@@ -197,14 +209,19 @@ export class AuthService {
             return true;
         }
 
-        // Fallback to localStorage
-        const cookieData = {
-            cookie: cookie.trim(),
-            expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-            saved: new Date().toISOString()
-        };
+        // Use centralized auth if available
+        if (window.CentralizedAuth) {
+            await window.CentralizedAuth.setCookie(cookie);
+        } else {
+            // Fallback to localStorage
+            const cookieData = {
+                cookie: cookie.trim(),
+                expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                saved: new Date().toISOString()
+            };
 
-        localStorage.setItem('elasticCookie', JSON.stringify(cookieData));
+            localStorage.setItem('elasticCookie', JSON.stringify(cookieData));
+        }
         this.authStatus = null; // Reset to force recheck
         return true;
     }
@@ -216,10 +233,10 @@ export class AuthService {
     async clearAuth() {
         // Use CentralizedAuth if available
         if (window.CentralizedAuth) {
-            await window.CentralizedAuth.clearCookie();
+            await window.CentralizedAuth.clearAuth();
+        } else {
+            localStorage.removeItem('elasticCookie');
         }
-
-        localStorage.removeItem('elasticCookie');
         this.authStatus = null;
 
         try {
