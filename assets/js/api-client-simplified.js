@@ -337,7 +337,7 @@ export class SimplifiedAPIClient {
             // Simple health check instead of full query
             // Note: health endpoint is at root, not under /api/v1
             const baseUrl = window.location.hostname === 'localhost' 
-                ? 'http://localhost:8000'
+                ? (window.API_URL || window.FASTAPI_URL || 'http://localhost:8000')
                 : '';
             const url = `${baseUrl}/health`;
             

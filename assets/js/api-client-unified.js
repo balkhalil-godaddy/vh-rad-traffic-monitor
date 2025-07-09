@@ -32,7 +32,7 @@ export class UnifiedAPIClient {
             this.baseUrl = window.PRODUCTION_API_URL;
         } else if (this.isLocalDev) {
             // Local development
-            this.baseUrl = 'http://localhost:8000';
+            this.baseUrl = window.API_URL || window.FASTAPI_URL || 'http://localhost:8000';
         } else {
             // Default to same origin
             this.baseUrl = window.location.origin;
@@ -46,7 +46,7 @@ export class UnifiedAPIClient {
             const wsHost = this.baseUrl.replace(/^https?:\/\//, '');
             this.wsUrl = `${wsProtocol}://${wsHost}/ws`;
         } else {
-            this.wsUrl = this.isLocalDev ? 'ws://localhost:8000/ws' : null;
+            this.wsUrl = this.isLocalDev ? (window.FASTAPI_WS_URL || 'ws://localhost:8000/ws') : null;
         }
 
         // Production mode now uses FastAPI server
@@ -419,7 +419,7 @@ export class UnifiedAPIClient {
             }
 
             // Send everything securely in request body
-            const esUrl = config.elasticsearch?.url || 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243';
+            const esUrl = config.elasticsearch?.url || window.ELASTICSEARCH_URL || 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243';
             const esPath = config.elasticsearch?.path || '/api/console/proxy?path=traffic-*/_search&method=POST';
 
             const requestBody = {
