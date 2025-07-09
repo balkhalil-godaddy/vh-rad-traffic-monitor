@@ -10,6 +10,9 @@ let syncTimer = null;
 let isInitialized = false;
 let environment = detectEnvironment();
 
+// Resource cleanup tracking
+let cleanupFunctions = [];
+
 // Environment detection
 function detectEnvironment() {
     const hostname = window.location.hostname;
@@ -653,6 +656,36 @@ export function stopAutoSync() {
         clearInterval(syncTimer);
         syncTimer = null;
     }
+}
+
+/**
+ * Clean up all resources and listeners
+ */
+export function cleanup() {
+    // Stop auto-sync
+    stopAutoSync();
+    
+    // Clear all listeners
+    listeners = [];
+    
+    // Execute cleanup functions
+    cleanupFunctions.forEach(cleanupFn => {
+        try {
+            cleanupFn();
+        } catch (error) {
+            console.error('Error during config service cleanup:', error);
+        }
+    });
+    cleanupFunctions = [];
+    
+    console.log('🧹 ConfigService: All resources cleaned up');
+}
+
+/**
+ * Add cleanup function to be called when service is destroyed
+ */
+export function addCleanupFunction(cleanupFn) {
+    cleanupFunctions.push(cleanupFn);
 }
 
 /**

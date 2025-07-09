@@ -58,9 +58,10 @@ export class UnifiedAPIClient {
         this.wsReconnectInterval = null;
         this.wsState = 'disconnected';
 
-        // Cache
+        // Cache with size limits to prevent memory leaks
         this.cache = new Map();
         this.CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+        this.MAX_CACHE_SIZE = 50; // Prevent unbounded growth
 
         // Performance tracking
         this.metrics = {
@@ -482,8 +483,14 @@ export class UnifiedAPIClient {
             });
         }
 
-        // Cache successful results
+        // Cache successful results with LRU eviction
         if (result.success) {
+            // Evict oldest entry if cache is full
+            if (this.cache.size >= this.MAX_CACHE_SIZE) {
+                const firstKey = this.cache.keys().next().value;
+                this.cache.delete(firstKey);
+            }
+            
             this.cache.set(cacheKey, {
                 data: result.data,
                 timestamp: Date.now()
@@ -782,9 +789,25 @@ export class UnifiedAPIClient {
      * Cleanup resources
      */
     cleanup() {
+        console.log('🧹 UnifiedAPIClient: Cleaning up resources...');
+        
+        // Disconnect WebSocket
         this.disconnectWebSocket();
+        
+        // Clear cache
         this.clearCache();
-        console.log('🧹 API Client cleaned up');
+        
+        // Clear all WebSocket handlers
+        this.wsHandlers.clear();
+        
+        // Clear metrics
+        this.metrics = {
+            requests: 0,
+            errors: 0,
+            totalTime: 0
+        };
+        
+        console.log('✅ UnifiedAPIClient: All resources cleaned up');
     }
 }
 
