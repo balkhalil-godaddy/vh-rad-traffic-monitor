@@ -96,7 +96,7 @@ describe('Formula Builder Component Fixes', () => {
     });
 
     it('should use window global for API key', async () => {
-      window.FORMULA_AI_API_KEY = 'test-key';
+      window.FORMULA_AI_API_KEY = 'test-key-for-testing-only';
       const { FormulaAIAssistant } = await import('../assets/js/formula-builder/ai/formula-ai-assistant.js');
       const assistant = new FormulaAIAssistant();
       

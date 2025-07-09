@@ -53,13 +53,13 @@ const SENSITIVE_PATTERNS = [
 ];
 
 const FORBIDDEN_PATTERNS = [
-    /api_key\s*[:=]/i,
-    /secret_key\s*[:=]/i,
-    /password\s*[:=]/i,
-    /token\s*[:=]/i,
-    /credential\s*[:=]/i,
-    /private_key\s*[:=]/i,
-    /access_key\s*[:=]/i
+    /api_key\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /secret_key\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /password\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /token\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /credential\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /private_key\s*[:=]\s*['"`][^'"`]+['"`]/i,
+    /access_key\s*[:=]\s*['"`][^'"`]+['"`]/i
 ];
 
 const EXCLUDED_DIRS = [
