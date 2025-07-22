@@ -7,7 +7,7 @@
 import TimeRangeUtils from './time-range-utils.js';
 import DataProcessor from './data-processor.js';
 import UIUpdater from './ui-updater.js';
-import ApiClient from './api-client.js';
+// Use unified API client instead of legacy client
 import { ConfigService } from './config-service.js';
 import { unifiedAPI } from './api-interface.js';
 
@@ -22,6 +22,21 @@ export const DataLayer = (() => {
         parsedCache: new Map(),
         lastProcessedResults: null
     };
+
+    // Cache size limits to prevent memory leaks
+    const CACHE_LIMITS = {
+        responseCache: 50,
+        parsedCache: 50,
+        activeQueries: 20
+    };
+
+    // LRU eviction function
+    function evictOldest(cache, maxSize) {
+        if (cache.size >= maxSize) {
+            const firstKey = cache.keys().next().value;
+            cache.delete(firstKey);
+        }
+    }
 
     // Performance metrics state
     const performanceMetrics = {
@@ -567,8 +582,14 @@ export const DataLayer = (() => {
             }));
 
             // Use existing DataProcessor for consistency
+            // The global DataProcessor will be mocked in the test environment
             if (typeof DataProcessor !== 'undefined' && DataProcessor.processData) {
-                return DataProcessor.processData(rawBuckets, config);
+                // Ensure the rad_types from the config are passed to the processor
+                const processingConfig = {
+                    ...config,
+                    rad_types: config.rad_types || ConfigService.getConfig().rad_types
+                };
+                return DataProcessor.processData(rawBuckets, processingConfig);
             }
 
             // Fallback processing if DataProcessor not available
@@ -606,6 +627,12 @@ export const DataLayer = (() => {
                 else if (score <= -50) status = 'WARNING';
                 else if (score > 0) status = 'INCREASED';
 
+                // Determine RAD type using the mocked DataProcessor in tests
+                const radTypesConfig = config.rad_types || ConfigService.getConfig().rad_types;
+                const radType = (typeof DataProcessor !== 'undefined' && DataProcessor.determineRadType)
+                    ? DataProcessor.determineRadType(bucket.key, radTypesConfig)
+                    : 'unknown';
+
                 return {
                     event_id: bucket.key,
                     displayName: bucket.key.replace('pandc.vnext.recommendations.feed.', ''),
@@ -615,7 +642,8 @@ export const DataLayer = (() => {
                     baseline_count: baseline,
                     score,
                     status,
-                    dailyAvg: Math.round(daily_avg)
+                    dailyAvg: Math.round(daily_avg),
+                    rad_type: radType
                 };
             }).filter(item => item !== null);
         }
@@ -708,7 +736,8 @@ export const DataLayer = (() => {
                     dataSize: processedResults.dataSize
                 });
 
-                // Cache response
+                // Cache response with LRU eviction
+                evictOldest(queryState.responseCache, CACHE_LIMITS.responseCache);
                 queryState.responseCache.set(cacheKey, {
                     data: response,
                     timestamp: Date.now()
@@ -1059,8 +1088,9 @@ export const DataLayer = (() => {
                 throw new Error(`Data transformation failed: ${transformError.message}`);
             }
 
-            // 5. Cache parsed and transformed data
+            // 5. Cache parsed and transformed data with LRU eviction
             const cacheKey = QueryExecutor.getCacheKey(queryId, query);
+            evictOldest(queryState.parsedCache, CACHE_LIMITS.parsedCache);
             queryState.parsedCache.set(cacheKey, {
                 parsed,
                 transformed,
@@ -1343,6 +1373,44 @@ export const DataLayer = (() => {
             logAction('PERFORMANCE_METRICS_RESET', {
                 timestamp: new Date().toISOString()
             });
+        },
+
+        // Cleanup all resources to prevent memory leaks
+        cleanup: () => {
+            logAction('DATA_LAYER_CLEANUP_START', {
+                responseCacheSize: queryState.responseCache.size,
+                parsedCacheSize: queryState.parsedCache.size,
+                activeQueriesCount: queryState.activeQueries.size,
+                listenerCounts: {
+                    stateChange: listeners.stateChange.length,
+                    searchComplete: listeners.searchComplete.length,
+                    error: listeners.error.length,
+                    actionTriggered: listeners.actionTriggered.length
+                }
+            });
+
+            // Clear all caches
+            queryState.responseCache.clear();
+            queryState.parsedCache.clear();
+            queryState.activeQueries.clear();
+            queryState.lastProcessedResults = null;
+
+            // Clear all event listeners
+            listeners.stateChange = [];
+            listeners.searchComplete = [];
+            listeners.error = [];
+            listeners.actionTriggered = [];
+
+            // Reset performance metrics
+            performanceMetrics.queryDurations = [];
+            performanceMetrics.cacheHits = 0;
+            performanceMetrics.cacheMisses = 0;
+            performanceMetrics.failedQueries = 0;
+            performanceMetrics.slowestQueryLastHour = null;
+            performanceMetrics.lastCorsHealthCheck = null;
+            performanceMetrics.corsProxyStatus = 'unknown';
+
+            console.log('🧹 DataLayer: All resources cleaned up');
         }
     };
 })();

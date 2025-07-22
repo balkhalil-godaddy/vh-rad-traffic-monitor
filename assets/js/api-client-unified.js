@@ -5,7 +5,9 @@
  */
 
 import TimeRangeUtils from './time-range-utils.js';
-import { ConfigService } from './config-service.js';
+import { ConfigService, getApiUrl, getElasticsearchUrl } from './config-service.js';
+import { cryptoUtils } from './crypto-utils.js';
+import { authManager } from './auth-manager.js';
 
 /**
  * Unified API Client
@@ -16,15 +18,28 @@ export class UnifiedAPIClient {
         // Environment detection
         this.isLocalDev = window.location.hostname === 'localhost' ||
                          window.location.hostname === '127.0.0.1';
-        this.isProduction = window.location.hostname.includes('github.io');
+        this.isProduction = window.location.hostname.includes('github.io') ||
+                           window.location.hostname.includes('github.com');
 
-        // Base URLs - unified server handles everything
-        this.baseUrl = this.isLocalDev ? 'http://localhost:8000' : '';
+        // Get configuration
+        const config = window.ConfigService?.getConfig() || {};
+
+        // Base URLs - use ConfigService method
+        this.baseUrl = getApiUrl();
+
         this.apiV1 = `${this.baseUrl}/api/v1`;
-        this.wsUrl = this.isLocalDev ? 'ws://localhost:8000/ws' : null;
 
-        // Production mode uses proxy, not direct API calls
-        this.useProxy = this.isProduction;
+        // WebSocket URL
+        if (config.features?.websocket && this.baseUrl) {
+            const wsProtocol = this.baseUrl.startsWith('https') ? 'wss' : 'ws';
+            const wsHost = this.baseUrl.replace(/^https?:\/\//, '');
+            this.wsUrl = `${wsProtocol}://${wsHost}/ws`;
+        } else {
+            this.wsUrl = null;
+        }
+
+        // Production mode now uses FastAPI server
+        this.useProxy = false;
 
         // WebSocket state
         this.websocket = null;
@@ -32,9 +47,10 @@ export class UnifiedAPIClient {
         this.wsReconnectInterval = null;
         this.wsState = 'disconnected';
 
-        // Cache
+        // Cache with size limits to prevent memory leaks
         this.cache = new Map();
         this.CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+        this.MAX_CACHE_SIZE = 50; // Prevent unbounded growth
 
         // Performance tracking
         this.metrics = {
@@ -49,90 +65,46 @@ export class UnifiedAPIClient {
     // ====================
 
     /**
-     * Get authentication cookie from various sources
+     * Get authentication cookie (delegate to AuthManager)
      */
-    getElasticCookie() {
-        // Check localStorage first
-        const saved = localStorage.getItem('elasticCookie');
-        if (saved) {
-            try {
-                const parsed = JSON.parse(saved);
-                if (parsed.expires && new Date(parsed.expires) > new Date()) {
-                    return parsed.cookie;
-                }
-            } catch (e) {
-                // Invalid JSON, continue checking
-            }
-        }
-
-        // Check window.ELASTIC_COOKIE
-        if (window.ELASTIC_COOKIE) {
-            return window.ELASTIC_COOKIE;
-        }
-
-        // No cookie found
-        return null;
+    async getElasticCookie() {
+        return authManager.getCookie();
     }
 
     /**
-     * Save authentication cookie
+     * Save authentication cookie (delegate to AuthManager)
      */
-    saveElasticCookie(cookie) {
+    async saveElasticCookie(cookie) {
         if (!cookie || !cookie.trim()) return false;
-
-        const cookieData = {
-            cookie: cookie.trim(),
-            expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-            saved: new Date().toISOString()
-        };
-
-        localStorage.setItem('elasticCookie', JSON.stringify(cookieData));
-        return true;
+        try {
+            authManager.setCookie(cookie);
+            return true;
+        } catch (error) {
+            console.error('Failed to save cookie:', error);
+            return false;
+        }
     }
 
     /**
      * Get authentication details
      */
     async getAuthenticationDetails() {
-        const cookie = this.getElasticCookie();
-
-        if (cookie) {
-            return {
-                valid: true,
-                method: this.isLocalDev ? 'unified-server' : 'direct',
-                cookie: cookie
-            };
-        }
-
+        const authenticated = authManager.isAuthenticated();
+        const status = authManager.getStatus();
+        
         return {
-            valid: false,
-            method: null,
-            cookie: null,
-            message: 'No authentication cookie found'
+            valid: authenticated,
+            authenticated: authenticated,
+            method: this.isLocalDev ? 'unified-server' : 'direct',
+            ...status
         };
     }
 
     /**
-     * Prompt user for cookie
+     * Prompt user for cookie (delegate to AuthManager)
      */
     async promptForCookie(purpose = 'API access') {
-        const cookie = prompt(
-            `Enter your Elastic authentication cookie for ${purpose}:\n\n` +
-            `1. Open Kibana in another tab\n` +
-            `2. Open Developer Tools (F12)\n` +
-            `3. Go to Network tab\n` +
-            `4. Refresh the page\n` +
-            `5. Find any request to Kibana\n` +
-            `6. Copy the 'Cookie' header value\n` +
-            `7. Paste it below\n\n` +
-            `Look for: sid=xxxxx`
-        );
-
-        if (cookie && this.saveElasticCookie(cookie)) {
-            return cookie.trim();
-        }
-
-        return null;
+        return await authManager.promptForCookie(purpose);
     }
 
     // ====================
@@ -142,14 +114,18 @@ export class UnifiedAPIClient {
     /**
      * Make HTTP request with consistent error handling
      */
-    async request(url, options = {}) {
+    async request(url, options = {}, retryCount = 0) {
         const startTime = Date.now();
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
         try {
+            // Add auth headers from AuthManager
+            const authHeaders = authManager.getAuthHeaders();
+            
             // Add default headers
             options.headers = {
                 'Content-Type': 'application/json',
+                ...authHeaders,
                 ...options.headers
             };
 
@@ -169,6 +145,20 @@ export class UnifiedAPIClient {
                 this.metrics.requests++;
                 this.metrics.totalTime += duration;
 
+                // Handle 401 - Authentication required
+                if (response.status === 401 && retryCount === 0) {
+                    console.log('🔐 Authentication required - prompting for cookie...');
+                    const newCookie = await authManager.promptForCookie();
+                    
+                    if (newCookie) {
+                        // Retry with new cookie
+                        console.log('🔄 Retrying with new authentication...');
+                        return this.request(url, options, retryCount + 1);
+                    } else {
+                        throw new Error('Authentication required but no cookie provided');
+                    }
+                }
+
                 if (!response.ok) {
                     const error = await response.json().catch(() => ({}));
                     throw new Error(error.detail || `HTTP ${response.status}: ${response.statusText}`);
@@ -178,7 +168,7 @@ export class UnifiedAPIClient {
 
                 // Log success
                 console.log(
-                    `✅ API Request → ${options.method || 'GET'} ${url} | ${duration}ms`,
+                    `(✓)API Request → ${options.method || 'GET'} ${url} | ${duration}ms`,
                     { requestId, status: response.status }
                 );
 
@@ -194,7 +184,7 @@ export class UnifiedAPIClient {
             this.metrics.errors++;
 
             console.error(
-                `❌ API Request Failed → ${options.method || 'GET'} ${url} | ${duration}ms`,
+                `(✗) API Request Failed → ${options.method || 'GET'} ${url} | ${duration}ms`,
                 { requestId, error: error.message }
             );
 
@@ -374,7 +364,7 @@ export class UnifiedAPIClient {
             }
 
             // Send everything securely in request body
-            const esUrl = config.elasticsearch?.url || 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243';
+            const esUrl = getElasticsearchUrl();
             const esPath = config.elasticsearch?.path || '/api/console/proxy?path=traffic-*/_search&method=POST';
 
             const requestBody = {
@@ -409,7 +399,7 @@ export class UnifiedAPIClient {
                     if (directResponse.ok) {
                         const directData = await directResponse.json();
                         if (!directData.error) {
-                            console.log('✅ Direct Elasticsearch connection successful!');
+                            console.log('(✓)Direct Elasticsearch connection successful!');
                             result = {
                                 success: true,
                                 data: directData,
@@ -437,8 +427,14 @@ export class UnifiedAPIClient {
             });
         }
 
-        // Cache successful results
+        // Cache successful results with LRU eviction
         if (result.success) {
+            // Evict oldest entry if cache is full
+            if (this.cache.size >= this.MAX_CACHE_SIZE) {
+                const firstKey = this.cache.keys().next().value;
+                this.cache.delete(firstKey);
+            }
+
             this.cache.set(cacheKey, {
                 data: result.data,
                 timestamp: Date.now()
@@ -663,6 +659,48 @@ export class UnifiedAPIClient {
     }
 
     /**
+     * Check if CORS proxy/server is available (legacy compatibility)
+     */
+    async checkCorsProxy() {
+        // In unified client, this is just a health check
+        try {
+            const response = await fetch(`${this.baseUrl}/health`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(1000)
+            });
+            return response.ok;
+        } catch (error) {
+            return false;
+        }
+    }
+
+    /**
+     * Test authentication (legacy compatibility)
+     */
+    async testAuthentication() {
+        try {
+            const health = await this.checkHealth();
+            if (health.healthy && health.authenticated) {
+                return {
+                    success: true,
+                    method: this.isProduction ? 'production-proxy' : 'local-server',
+                    message: 'Authentication validated successfully'
+                };
+            } else {
+                return {
+                    success: false,
+                    error: health.message || 'Authentication failed'
+                };
+            }
+        } catch (error) {
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+
+    /**
      * Initialize client
      */
     async initialize() {
@@ -671,6 +709,17 @@ export class UnifiedAPIClient {
         // Check health
         const health = await this.checkHealth();
         console.log('Health check:', health);
+
+        // Emit connection status
+        if (health.healthy) {
+            window.dispatchEvent(new CustomEvent('api:connected', {
+                detail: { message: 'API connected successfully' }
+            }));
+        } else {
+            window.dispatchEvent(new CustomEvent('api:disconnected', {
+                detail: { message: health.message || 'API connection failed' }
+            }));
+        }
 
         // Connect WebSocket if in local dev
         if (this.isLocalDev) {
@@ -684,9 +733,25 @@ export class UnifiedAPIClient {
      * Cleanup resources
      */
     cleanup() {
+        console.log('🧹 UnifiedAPIClient: Cleaning up resources...');
+
+        // Disconnect WebSocket
         this.disconnectWebSocket();
+
+        // Clear cache
         this.clearCache();
-        console.log('🧹 API Client cleaned up');
+
+        // Clear all WebSocket handlers
+        this.wsHandlers.clear();
+
+        // Clear metrics
+        this.metrics = {
+            requests: 0,
+            errors: 0,
+            totalTime: 0
+        };
+
+        console.log('✅ UnifiedAPIClient: All resources cleaned up');
     }
 }
 

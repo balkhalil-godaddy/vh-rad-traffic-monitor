@@ -3,6 +3,8 @@
  * Central control point for all FastAPI features
  */
 
+import { getApiUrl } from './config-service.js';
+
 /**
  * Exponential Backoff with Jitter for reconnection
  */
@@ -13,7 +15,7 @@ class ExponentialBackoffReconnect {
         this.factor = factor;
         this.attempt = 0;
     }
-    
+
     nextDelay() {
         const exponentialDelay = Math.min(
             this.baseDelay * Math.pow(this.factor, this.attempt++),
@@ -23,7 +25,7 @@ class ExponentialBackoffReconnect {
         const jitter = exponentialDelay * 0.2 * Math.random();
         return Math.round(exponentialDelay + jitter);
     }
-    
+
     reset() {
         this.attempt = 0;
     }
@@ -35,8 +37,13 @@ export const FastAPIIntegration = {
 
     // Central configuration
     config: {
-        apiUrl: window.FASTAPI_URL || 'http://localhost:8000',
-        wsUrl: window.FASTAPI_WS_URL || 'ws://localhost:8000/ws',
+        apiUrl: getApiUrl(),
+        wsUrl: (() => {
+            const apiUrl = getApiUrl();
+            const wsProtocol = apiUrl.startsWith('https') ? 'wss' : 'ws';
+            const wsHost = apiUrl.replace(/^https?:\/\//, '');
+            return `${wsProtocol}://${wsHost}/ws`;
+        })(),
         reconnectInterval: 5000, // Deprecated - using exponential backoff
         maxReconnectAttempts: 10, // Increased for exponential backoff
         enableRealtime: true,
@@ -69,7 +76,7 @@ export const FastAPIIntegration = {
         // Check if explicitly disabled
         const forceDisabled = localStorage.getItem('fastapi.disabled') === 'true';
         if (forceDisabled) {
-            console.log('❌ FastAPI explicitly disabled');
+            console.log('(✗) FastAPI explicitly disabled');
             return false;
         }
 
@@ -77,7 +84,7 @@ export const FastAPIIntegration = {
         const forceEnabled = localStorage.getItem('fastapi.enabled') === 'true';
         if (forceEnabled) {
             this.enabled = true;
-            console.log('✅ FastAPI explicitly enabled');
+            console.log('(✓)FastAPI explicitly enabled');
             await this.setupAdapters();
             return true;
         }
@@ -124,11 +131,11 @@ export const FastAPIIntegration = {
      * Set up adapters for API calls
      */
     async setupAdapters() {
-        // Dynamically import FastAPI modules only when needed
-        const { FastAPIClient } = await import('./api-client-fastapi.js');
+        // Use the unified API client which already has WebSocket support
+        const { default: apiClient } = await import('./api-client-unified.js');
 
-        // Initialize the FastAPI client
-        this.client = FastAPIClient;
+        // Use the unified client
+        this.client = apiClient;
 
         // Initialize the client
         await this.client.initialize();
@@ -145,18 +152,18 @@ export const FastAPIIntegration = {
     async setupWebSocket() {
         // Initialize exponential backoff
         this.state.reconnectBackoff = new ExponentialBackoffReconnect();
-        
+
         // Set up WebSocket event handlers to bridge to UI
         this.client.on('config', (data) => {
             // Emit event for UI updater
             window.dispatchEvent(new CustomEvent('fastapi:config', { detail: data }));
         });
-        
+
         this.client.on('stats', (data) => {
             // Emit event for UI updater
             window.dispatchEvent(new CustomEvent('fastapi:stats', { detail: data }));
         });
-        
+
         this.client.on('data', (data) => {
             // Emit event for UI updater
             window.dispatchEvent(new CustomEvent('fastapi:data', { detail: data }));
@@ -181,7 +188,7 @@ export const FastAPIIntegration = {
                     console.log(`🔄 Retrying WebSocket connection (${this.state.reconnectAttempts}/${this.config.maxReconnectAttempts}) in ${delay}ms...`);
                     setTimeout(connectWithRetry, delay);
                 } else {
-                    console.error('❌ WebSocket reconnection failed after maximum attempts');
+                    console.error('(✗) WebSocket reconnection failed after maximum attempts');
                 }
             }
         };

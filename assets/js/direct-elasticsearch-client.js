@@ -3,28 +3,20 @@
  * This bypasses proxy issues when CORS extension is active
  */
 
+import { getElasticsearchUrl } from './config-service.js';
+import { authManager } from './auth-manager.js';
+
 export class DirectElasticsearchClient {
     constructor() {
-        this.elasticsearchUrl = 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243';
+        this.elasticsearchUrl = getElasticsearchUrl();
         this.indexPath = '/elasticsearch/usi*/_search';
     }
 
     /**
-     * Get authentication cookie from localStorage
+     * Get authentication cookie from centralized auth or localStorage
      */
     getAuthCookie() {
-        try {
-            const saved = localStorage.getItem('elasticCookie');
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                if (parsed.expires && new Date(parsed.expires) > new Date()) {
-                    return parsed.cookie;
-                }
-            }
-        } catch (e) {
-            console.warn('Failed to parse saved cookie:', e);
-        }
-        return null;
+        return authManager.getCookie();
     }
 
     /**
@@ -32,7 +24,7 @@ export class DirectElasticsearchClient {
      */
     async executeQuery(query) {
         const cookie = this.getAuthCookie();
-        
+
         if (!cookie) {
             return {
                 success: false,
@@ -41,10 +33,10 @@ export class DirectElasticsearchClient {
         }
 
         const url = `${this.elasticsearchUrl}${this.indexPath}`;
-        
+
         try {
             console.log('🔄 Attempting direct Elasticsearch connection...');
-            
+
             const response = await fetch(url, {
                 method: 'POST',
                 headers: {
@@ -68,7 +60,7 @@ export class DirectElasticsearchClient {
             }
 
             const data = await response.json();
-            
+
             if (data.error) {
                 return {
                     success: false,
@@ -76,7 +68,7 @@ export class DirectElasticsearchClient {
                 };
             }
 
-            console.log('✅ Direct Elasticsearch connection successful!');
+            console.log('(✓)Direct Elasticsearch connection successful!');
             return {
                 success: true,
                 data: data,
@@ -99,8 +91,8 @@ export class DirectElasticsearchClient {
     async testConnection() {
         const testQuery = {
             size: 0,
-            query: { 
-                bool: { 
+            query: {
+                bool: {
                     filter: [{
                         range: {
                             "@timestamp": {
@@ -118,4 +110,4 @@ export class DirectElasticsearchClient {
 
 // Create singleton instance
 export const directClient = new DirectElasticsearchClient();
-export default directClient; 
+export default directClient;

@@ -130,7 +130,7 @@ export const DataLayerExample = (() => {
     // =======================
 
     function exampleStateInspection() {
-        console.log('📊 Inspecting query state...');
+        console.log(' Inspecting query state...');
 
         const state = DataLayer.getQueryState();
         console.log('Active queries:', state.activeQueries.size);
@@ -211,7 +211,7 @@ export const DataLayerExample = (() => {
                 console.log('Real data fetch skipped (no auth):', error.message);
             }
 
-            console.log('✅ All examples complete!');
+            console.log('(✓)All examples complete!');
         },
 
         // Individual examples

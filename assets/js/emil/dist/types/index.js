@@ -1,0 +1,4 @@
+/**
+ * EMIL Type Definitions
+ */
+export {};

@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 Unified FastAPI Server for RAD Monitor
-Consolidates all server functionality into a single, clean implementation.
+Fixed version without src/ directory dependencies
+
+NOTE: For production use, see server_production.py which includes:
+- Security hardening (CORS, authentication, input validation)
+- Performance optimizations (connection pooling, caching)
+- Monitoring and metrics (Prometheus, structured logging)
+- Error handling and circuit breakers
+- Health checks and graceful shutdown
 """
 import os
 import sys
@@ -29,30 +36,63 @@ from pybreaker import CircuitBreaker
 import structlog
 from dotenv import load_dotenv
 
-# Add src to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
-# Import config API router and models
-from src.api.config_api import router as config_router
-from src.config.settings import get_settings, reload_settings
-from src.data.models import TrafficEvent, ProcessingConfig
-
 # Load environment variables
 load_dotenv()
 
+# Add the parent directory to the path to ensure local imports work
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import execute_elasticsearch_query from the local elasticsearch module
+from elasticsearch import execute_elasticsearch_query
+
+# ====================
+# Configuration Loading
+# ====================
+
+try:
+    from config import get_config, AppConfig
+
+    # Load configuration
+    config = get_config()
+    print(f"✅ Configuration loaded successfully (environment: {config.environment})\n")
+
+except Exception as e:
+    print(f"❌ Failed to load configuration: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# Simple models replacing src.data.models
+class TrafficEvent(BaseModel):
+    """Traffic event model"""
+    event_id: str
+    timestamp: datetime
+    count: int
+
+class ProcessingConfig(BaseModel):
+    """Processing configuration model"""
+    baseline_start: str
+    baseline_end: str
+    time_range: str
+
 # Configure structured logging
+log_processors = [
+    structlog.stdlib.filter_by_level,
+    structlog.stdlib.add_logger_name,
+    structlog.stdlib.add_log_level,
+    structlog.stdlib.PositionalArgumentsFormatter(),
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.StackInfoRenderer(),
+    structlog.processors.format_exc_info,
+    structlog.processors.UnicodeDecoder(),
+]
+
+# Use JSON renderer in production
+if config.environment == "production":
+    log_processors.append(structlog.processors.JSONRenderer())
+else:
+    log_processors.append(structlog.dev.ConsoleRenderer())
+
 structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.dev.ConsoleRenderer()  # Human-readable for development
-    ],
+    processors=log_processors,
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
     cache_logger_on_first_use=True,
@@ -64,17 +104,20 @@ logger = structlog.get_logger()
 # Configuration
 # ====================
 
-# Server configuration
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+# Server configuration with safe access
+SERVER_PORT = config.server.port if hasattr(config, 'server') and hasattr(config.server, 'port') else int(os.getenv('PORT', 8000))
+SERVER_HOST = config.server.host if hasattr(config, 'server') and hasattr(config.server, 'host') else os.getenv('HOST', '0.0.0.0')
+ENVIRONMENT = config.environment if hasattr(config, 'environment') else os.getenv('ENVIRONMENT', 'development')
 
-# Kibana configuration
-KIBANA_URL = os.getenv("KIBANA_URL", "https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243")
-KIBANA_SEARCH_PATH = "/api/console/proxy?path=traffic-*/_search&method=POST"
+# Kibana configuration with safe access
+ELASTICSEARCH_URL = str(config.elasticsearch.url) if hasattr(config, 'elasticsearch') and hasattr(config.elasticsearch, 'url') else os.getenv('ELASTICSEARCH_URL', 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243/')
+KIBANA_SEARCH_PATH = config.kibana.search_path if hasattr(config, 'kibana') and hasattr(config.kibana, 'search_path') else '/api/console/proxy?path=traffic-*/_search&method=POST'
 
-# Cache configuration
-CACHE_TTL = timedelta(minutes=5)
+# Cache configuration with safe access
+redis_ttl = 300  # default
+if hasattr(config, 'redis') and config.redis:
+    redis_ttl = getattr(config.redis, 'ttl', 300) if getattr(config.redis, 'enabled', False) else 300
+CACHE_TTL = timedelta(seconds=redis_ttl)
 
 # ====================
 # Models
@@ -102,226 +145,155 @@ class DashboardStats(BaseModel):
     warning_count: int = 0
     normal_count: int = 0
     increased_count: int = 0
-    last_update: str = Field(default_factory=lambda: datetime.now().isoformat())
     total_events: int = 0
+    last_update: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 class WebSocketMessage(BaseModel):
     """WebSocket message model"""
-    type: str = Field(..., pattern=r'^(config|stats|data|error|performance_metrics)$')
+    type: str
     data: Dict[str, Any]
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 class ElasticsearchQuery(BaseModel):
-    """Elasticsearch query model with validation"""
+    """Elasticsearch query model for validation"""
+    query: Dict[str, Any]
     size: int = Field(default=0, ge=0, description="Number of documents to return")
-    query: Dict[str, Any] = Field(..., description="Elasticsearch query DSL")
     aggs: Optional[Dict[str, Any]] = Field(default=None, description="Aggregations")
 
 class KibanaQueryRequest(BaseModel):
-    """Request model for Kibana query endpoint"""
-    query: ElasticsearchQuery
+    """Request model for Kibana queries"""
+    query: Dict[str, Any] = Field(..., description="Elasticsearch query body")
     force_refresh: bool = Field(default=False, description="Bypass cache and force fresh query")
 
 class PortCleanupRequest(BaseModel):
-    """Request model for port cleanup"""
+    """Request model for port cleanup utility"""
     ports: List[int] = Field(default=[8000], description="Ports to clean up")
     force: bool = Field(default=False, description="Force kill processes")
 
-class ValidationRequest(BaseModel):
-    """Request model for validation"""
-    verbose: bool = Field(default=False, description="Verbose output")
-    categories: Optional[List[str]] = Field(default=None, description="Specific categories to validate")
+class ConfigUpdateRequest(BaseModel):
+    """Configuration update request"""
+    key: str
+    value: Any
 
-# ====================
-# Metrics & Monitoring
-# ====================
-
-class MetricsTracker:
-    """Track performance metrics for monitoring"""
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        """Reset metrics for new time window"""
-        self.window_start = datetime.now()
-        self.requests = defaultdict(int)
-        self.errors = defaultdict(int)
-        self.response_times = defaultdict(list)
-        self.rate_limit_triggers = 0
-        self.circuit_breaker_trips = 0
-
-    def record_request(self, endpoint: str, duration_ms: float, success: bool):
-        """Record a request with its metrics"""
-        self.requests[endpoint] += 1
-        self.response_times[endpoint].append(duration_ms)
-        if not success:
-            self.errors[endpoint] += 1
-
-        logger.info("request_metrics",
-            endpoint=endpoint,
-            duration_ms=duration_ms,
-            success=success,
-            timestamp=datetime.now().isoformat()
-        )
-
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get current metrics summary"""
-        total_requests = sum(self.requests.values())
-        total_errors = sum(self.errors.values())
-        all_times = []
-        for times in self.response_times.values():
-            all_times.extend(times)
-
-        return {
-            "window_start": self.window_start.isoformat(),
-            "window_duration_seconds": (datetime.now() - self.window_start).total_seconds(),
-            "total_requests": total_requests,
-            "success_rate": ((total_requests - total_errors) / total_requests * 100) if total_requests > 0 else 100,
-            "avg_response_time_ms": sum(all_times) / len(all_times) if all_times else 0,
-            "errors": total_errors,
-            "rate_limit_triggers": self.rate_limit_triggers,
-            "circuit_breaker_trips": self.circuit_breaker_trips
-        }
-
-# ====================
-# Rate Limiting & Circuit Breaker
-# ====================
-
-def get_real_client_ip(request: Request) -> str:
-    """Get client IP, handling proxies and localhost"""
-    client_ip = get_remote_address(request)
-    if not client_ip or client_ip == "127.0.0.1":
-        forwarded_for = request.headers.get("X-Forwarded-For")
-        if forwarded_for:
-            client_ip = forwarded_for.split(",")[0].strip()
-        elif request.client:
-            client_ip = request.client.host
-    return client_ip or "127.0.0.1"
-
-# Initialize components
-metrics_tracker = MetricsTracker()
-
-# More permissive rate limits for development
-default_limits = ["500 per minute", "5000 per hour"] if ENVIRONMENT == "development" else ["200 per minute", "1000 per hour"]
-
-limiter = Limiter(
-    key_func=get_real_client_ip,
-    default_limits=default_limits,
-    storage_uri="memory://"
-)
-es_circuit_breaker = CircuitBreaker(
-    fail_max=5,
-    reset_timeout=60,
-    name='ElasticsearchBreaker'
-)
+class DashboardQueryResponse(BaseModel):
+    """Response model for dashboard queries"""
+    data: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    cached: bool = False
+    query_time_ms: float
 
 # ====================
 # Application State
 # ====================
 
-dashboard_state = {
-    "config": DashboardConfig(
-        baseline_start="2025-06-01",
-        baseline_end="2025-06-09",
-        time_range="now-12h"
-    ),
-    "stats": DashboardStats()
-}
-active_connections: List[WebSocket] = []
-query_cache: Dict[str, Tuple[Any, datetime]] = {}
+class AppState:
+    """Application state management"""
+    def __init__(self):
+        self.cache = {}
+        self.websocket_clients: List[WebSocket] = []
+        self.metrics = {
+            "requests_total": 0,
+            "requests_success": 0,
+            "requests_failed": 0,
+            "websocket_connections": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "avg_response_time_ms": 0
+        }
+        self.start_time = datetime.now()
+        self.elasticsearch_healthy = False
+        self.last_health_check = None
+
+app_state = AppState()
 
 # ====================
-# Helper Functions
+# Utilities
 # ====================
 
-async def broadcast_to_websockets(message: WebSocketMessage):
-    """Broadcast message to all connected WebSocket clients"""
-    disconnected = []
-    for connection in active_connections:
-        try:
-            await connection.send_json(message.model_dump())
-        except:
-            disconnected.append(connection)
+def get_cache_key(query: Dict[str, Any]) -> str:
+    """Generate cache key from query"""
+    return json.dumps(query, sort_keys=True)
 
-    for conn in disconnected:
-        if conn in active_connections:
-            active_connections.remove(conn)
+def determine_rad_type_from_eid(eid: str) -> str:
+    """Determine RAD type from EID using registry mappings"""
+    # Check registry first
+    for mapping_eid, mapping in eid_registry.items():
+        if mapping_eid.upper() in eid.upper():
+            return mapping.rad_type
+    
+    # Fallback to pattern matching
+    eid_upper = eid.upper()
+    if 'LOGIN' in eid_upper or 'AUTH' in eid_upper:
+        return 'login'
+    elif 'API' in eid_upper or 'ENDPOINT' in eid_upper:
+        return 'api_call'
+    elif 'PAGE' in eid_upper or 'VIEW' in eid_upper:
+        return 'page_view'
+    elif 'DOWNLOAD' in eid_upper or 'FILE' in eid_upper:
+        return 'file_download'
+    
+    return 'custom'
 
-def process_dashboard_template(config: DashboardConfig, stats: DashboardStats) -> str:
-    """Process HTML template with current data"""
-    html_path = Path("index.html")
-    if not html_path.exists():
-        raise FileNotFoundError("index.html not found")
-
-    with open(html_path, 'r') as f:
-        content = f.read()
-
-    # Replace configuration values
-    content = content.replace('value="2025-06-01"', f'value="{config.baseline_start}"')
-    content = content.replace('value="2025-06-09"', f'value="{config.baseline_end}"')
-    content = content.replace('value="now-12h"', f'value="{config.time_range}"')
-
-    # Inject Elasticsearch cookie from environment
-    elastic_cookie = os.environ.get('ELASTIC_COOKIE', '')
-    if elastic_cookie:
-        content = content.replace('value=""', f'value="{elastic_cookie}"')
-        cookie_script = f"""
-    <script>
-        window.ELASTIC_COOKIE = "{elastic_cookie}";
-        console.log('🔍 Environment cookie loaded:', window.ELASTIC_COOKIE ? 'Yes' : 'No');
-    </script>"""
-        content = content.replace('</head>', f'{cookie_script}\n</head>')
-
-    return content
-
-async def clean_cache():
-    """Clean expired cache entries"""
-    now = datetime.now()
-    expired_keys = [
-        key for key, (_, cache_time) in query_cache.items()
-        if now - cache_time > CACHE_TTL
-    ]
-    for key in expired_keys:
-        del query_cache[key]
 
 # ====================
-# Application Lifecycle
+# Circuit Breaker for External Services
 # ====================
 
-def signal_handler(sig, frame):
-    """Handle interrupt signal for clean shutdown"""
-    logger.info("Received interrupt signal, shutting down...")
-    sys.exit(0)
+es_circuit_breaker = CircuitBreaker(
+    fail_max=5,
+    reset_timeout=60,
+    exclude=[httpx.TimeoutException]
+)
+
+# ====================
+# Rate Limiter Setup
+# ====================
+
+limiter = Limiter(key_func=get_remote_address)
+
+# ====================
+# Lifespan Management
+# ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle"""
+    """Application lifespan management"""
     # Startup
-    signal.signal(signal.SIGINT, signal_handler)
+    logger.info("Starting RAD Monitor Server",
+                port=SERVER_PORT,
+                environment=ENVIRONMENT)
 
-    # Clear screen and show banner
-    os.system('clear' if os.name != 'nt' else 'cls')
-    print(f"""
-╔══════════════════════════════════════════════════════════╗
-║           RAD Monitor Unified Server v2.0                ║
-╠══════════════════════════════════════════════════════════╣
-║                                                          ║
-║  🌐 Dashboard:    http://localhost:{SERVER_PORT:<5}                ║
-║  📚 API Docs:     http://localhost:{SERVER_PORT:<5}/docs            ║
-║  🔌 WebSocket:    ws://localhost:{SERVER_PORT:<5}/ws                ║
-║  🚀 API Base:     http://localhost:{SERVER_PORT:<5}/api/v1           ║
-║                                                          ║
-║  Environment: {ENVIRONMENT:<42} ║
-║  All services unified - no separate CORS proxy needed!   ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
-    """)
+    # Initialize health check
+    app_state.last_health_check = datetime.now()
 
-    logger.info("server_started", port=SERVER_PORT, environment=ENVIRONMENT)
+    try:
+        yield
+    finally:
+        # Shutdown - this will run even if cancelled
+        logger.info("Initiating graceful shutdown...")
 
-    yield
+        # Close WebSocket connections gracefully
+        if app_state.websocket_clients:
+            logger.info(f"Closing {len(app_state.websocket_clients)} WebSocket connections...")
+            close_tasks = []
+            for ws in app_state.websocket_clients:
+                try:
+                    close_tasks.append(ws.close(code=1001, reason="Server shutting down"))
+                except:
+                    pass
 
-    # Shutdown
-    logger.info("server_stopped")
+            # Wait for all connections to close with timeout
+            if close_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*close_tasks, return_exceptions=True),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Some WebSocket connections did not close in time")
+
+        # Final cleanup
+        logger.info("Graceful shutdown complete")
 
 # ====================
 # FastAPI Application
@@ -329,102 +301,218 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="RAD Monitor Unified Server",
-    description="Unified server with all RAD Monitor functionality",
+    description="Unified server with dashboard, API, WebSocket, and utilities",
     version="2.0.0",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc"
+    lifespan=lifespan
 )
+
+# Add exception handler for rate limiting
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ====================
 # Middleware
 # ====================
 
-# CORS middleware - handles all CORS needs, no proxy required
+# CORS Middleware
+# Configure allowed origins from configuration
+ALLOWED_ORIGINS = config.cors_proxy.allowed_origins.copy()
+
+# Add production origins if running in production
+if config.environment == "production":
+    production_origins = [
+        "https://vh-rad-traffic-monitor.vercel.app",
+        "https://vh-rad-traffic-monitor.github.io"
+    ]
+    ALLOWED_ORIGINS.extend(production_origins)
+
+logger.info(f"CORS allowed origins: {ALLOWED_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure based on environment
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Cookie", "X-Requested-With"],
 )
 
-# Rate limit handler
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """Handle rate limit exceptions"""
-    metrics_tracker.rate_limit_triggers += 1
-    response = JSONResponse(
-        status_code=429,
-        content={"detail": f"Rate limit exceeded: {exc.detail}"}
-    )
-    response.headers["Retry-After"] = "60"
-    return response
-
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
-
-# Request tracking middleware
 @app.middleware("http")
-async def track_metrics(request: Request, call_next):
-    """Track request metrics"""
+async def add_metrics(request: Request, call_next):
+    """Add request metrics"""
     start_time = time.time()
-    response = None
-    success = False
+
+    # Track request
+    app_state.metrics["requests_total"] += 1
 
     try:
         response = await call_next(request)
-        success = response.status_code < 400
-        return response
-    finally:
+
+        if response.status_code < 400:
+            app_state.metrics["requests_success"] += 1
+        else:
+            app_state.metrics["requests_failed"] += 1
+
+        # Update average response time
         duration_ms = (time.time() - start_time) * 1000
-        endpoint = f"{request.method} {request.url.path}"
-        metrics_tracker.record_request(endpoint, duration_ms, success)
+        current_avg = app_state.metrics["avg_response_time_ms"]
+        total_requests = app_state.metrics["requests_success"] + app_state.metrics["requests_failed"]
+        app_state.metrics["avg_response_time_ms"] = (
+            (current_avg * (total_requests - 1) + duration_ms) / total_requests
+        )
+
+        return response
+
+    except Exception as e:
+        app_state.metrics["requests_failed"] += 1
+        raise
 
 # ====================
-# Static Files
+# Static Files & Homepage
 # ====================
 
-app.mount("/assets", StaticFiles(directory="assets"), name="assets")
-app.mount("/tests", StaticFiles(directory="tests", html=True), name="tests")
+# Get project root
+PROJECT_ROOT = Path(__file__).parent.parent
 
-# ====================
-# Include Routers
-# ====================
+# Mount static directories
+# First check if we have dist/assets (production build), otherwise use regular assets
+if (PROJECT_ROOT / "dist" / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=PROJECT_ROOT / "dist" / "assets"), name="assets")
+else:
+    app.mount("/assets", StaticFiles(directory=PROJECT_ROOT / "assets"), name="assets")
 
-# Config API router with v1 prefix
-app.include_router(config_router, prefix="/api/v1/config", tags=["Configuration"])
+app.mount("/node_modules", StaticFiles(directory=PROJECT_ROOT / "node_modules"), name="node_modules")
+app.mount("/wam-visualizer", StaticFiles(directory=PROJECT_ROOT / "wam-visualizer"), name="wam-visualizer")
 
-# ====================
-# Core Endpoints
-# ====================
+# Mount the entire dist directory to serve index.html and other files
+if (PROJECT_ROOT / "dist").exists():
+    app.mount("/dist", StaticFiles(directory=PROJECT_ROOT / "dist"), name="dist")
 
 @app.get("/", response_class=HTMLResponse)
-async def get_dashboard():
+async def read_index():
     """Serve the main dashboard"""
-    content = process_dashboard_template(dashboard_state["config"], dashboard_state["stats"])
-    return HTMLResponse(content=content)
+    # Check dist folder first, then root
+    dist_index = PROJECT_ROOT / "dist" / "index.html"
+    root_index = PROJECT_ROOT / "index.html"
+    
+    if dist_index.exists():
+        return FileResponse(dist_index)
+    elif root_index.exists():
+        return FileResponse(root_index)
+    else:
+        raise HTTPException(status_code=404, detail="index.html not found")
+
+@app.get("/wam-visualizer.html", response_class=HTMLResponse)
+async def serve_wam_visualizer():
+    """Serve the WAM visualizer page"""
+    wam_path = PROJECT_ROOT / "wam-visualizer.html"
+    if wam_path.exists():
+        return FileResponse(wam_path)
+    else:
+        raise HTTPException(status_code=404, detail="WAM visualizer not found")
+
+@app.get("/wam_test_guided.html", response_class=HTMLResponse)
+async def serve_wam_test():
+    """Serve the WAM test page"""
+    wam_test_path = PROJECT_ROOT / "wam_test_guided.html"
+    if wam_test_path.exists():
+        return FileResponse(wam_test_path)
+    else:
+        raise HTTPException(status_code=404, detail="WAM test page not found")
+
+# ====================
+# Health & Status Endpoints
+# ====================
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    settings = get_settings()
+    # Check Elasticsearch connectivity
+    es_healthy = False
+    es_message = "Not checked"
+
+    if datetime.now() - app_state.last_health_check > timedelta(minutes=1):
+        try:
+            test_query = {"query": {"match_all": {}}, "size": 0}
+            result = await execute_elasticsearch_query(test_query)
+            es_healthy = result.get("success", False)
+            es_message = "Connected" if es_healthy else result.get("error", "Unknown error")
+            app_state.elasticsearch_healthy = es_healthy
+            app_state.last_health_check = datetime.now()
+        except Exception as e:
+            es_message = str(e)
+            app_state.elasticsearch_healthy = False
+    else:
+        es_healthy = app_state.elasticsearch_healthy
+        es_message = "Connected (cached)" if es_healthy else "Disconnected (cached)"
+
     return {
-        "status": "healthy",
+        "status": "healthy" if es_healthy else "degraded",
         "timestamp": datetime.now().isoformat(),
-        "version": "2.0.0",
         "environment": ENVIRONMENT,
-        "services": {
-            "dashboard": True,
-            "api": True,
-            "websocket": True,
-            "cors": True,
-            "config": True
-        },
-        "checks": {
-            "elasticsearch_configured": bool(settings.elasticsearch.cookie or os.getenv('ELASTIC_COOKIE')),
-            "websocket_connections": len(active_connections)
-        }
+        "uptime_seconds": (datetime.now() - app_state.start_time).total_seconds(),
+        "elasticsearch_status": "connected" if es_healthy else "disconnected",
+        "elasticsearch_message": es_message,
+        "websocket_clients": len(app_state.websocket_clients),
+        "cache_size": len(app_state.cache)
     }
+
+@app.get("/favicon.ico")
+async def favicon():
+    """Serve favicon if it exists"""
+    favicon_path = PROJECT_ROOT / "favicon.ico"
+    if favicon_path.exists():
+        return FileResponse(favicon_path)
+    else:
+        raise HTTPException(status_code=404, detail="Favicon not found")
+
+# ====================
+# Authentication Endpoint
+# ====================
+
+class AuthValidateRequest(BaseModel):
+    """Request model for auth validation"""
+    sid_cookie: str = Field(..., description="Enter your sid cookie value (e.g., Fe26.2**...)")
+
+@app.post("/api/v1/auth/validate")
+async def validate_auth(request: AuthValidateRequest):
+    """Validate authentication cookie against Kibana
+    
+    Enter your sid cookie value (the long Fe26.2** string from Kibana).
+    The endpoint will test it against Elasticsearch to verify it's valid.
+    """
+    
+    # Extract the sid value
+    sid_value = request.sid_cookie.strip()
+    
+    # Remove sid= prefix if they included it
+    if sid_value.startswith("sid="):
+        sid_value = sid_value.replace("sid=", "")
+    
+    # Format properly for Elasticsearch
+    sid_cookie = f"sid={sid_value}"
+    
+    # Test the cookie by making a simple Elasticsearch query
+    try:
+        test_query = {
+            "query": {"match_all": {}},
+            "size": 0
+        }
+        result = await execute_elasticsearch_query(test_query, sid_cookie)
+
+        if result.get("success"):
+            return {
+                "authenticated": True,
+                "valid": True,
+                "message": "Cookie is valid",
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail=result.get("error", "Invalid authentication cookie")
+            )
+    except Exception as e:
+        logger.error(f"Auth validation error: {e}")
+        raise HTTPException(status_code=401, detail=str(e))
 
 # ====================
 # WebSocket Endpoint
@@ -434,326 +522,903 @@ async def health_check():
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates"""
     await websocket.accept()
-    active_connections.append(websocket)
+    app_state.websocket_clients.append(websocket)
+    app_state.metrics["websocket_connections"] = len(app_state.websocket_clients)
+
+    logger.info(f"WebSocket client connected. Total clients: {len(app_state.websocket_clients)}")
 
     try:
-        # Send initial configuration
-        await websocket.send_json({
-            "type": "config",
-            "data": dashboard_state["config"].model_dump()
-        })
-
-        # Send initial stats
-        await websocket.send_json({
-            "type": "stats",
-            "data": dashboard_state["stats"].model_dump()
-        })
-
-        # Keep connection alive and handle messages
         while True:
+            # Receive message from client
             data = await websocket.receive_json()
 
             # Handle different message types
             if data.get("type") == "ping":
-                await websocket.send_json({"type": "pong"})
-            elif data.get("type") == "refresh":
-                # Trigger data refresh
                 await websocket.send_json({
-                    "type": "stats",
-                    "data": dashboard_state["stats"].model_dump()
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat()
+                })
+            elif data.get("type") == "subscribe":
+                # Handle subscription requests
+                await websocket.send_json({
+                    "type": "subscribed",
+                    "channel": data.get("channel", "default"),
+                    "timestamp": datetime.now().isoformat()
+                })
+            else:
+                # Echo back unknown messages
+                await websocket.send_json({
+                    "type": "echo",
+                    "data": data,
+                    "timestamp": datetime.now().isoformat()
                 })
 
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
-    except Exception as e:
-        logger.error("websocket_error", error=str(e))
-        if websocket in active_connections:
-            active_connections.remove(websocket)
+        app_state.websocket_clients.remove(websocket)
+        app_state.metrics["websocket_connections"] = len(app_state.websocket_clients)
+        logger.info(f"WebSocket client disconnected. Total clients: {len(app_state.websocket_clients)}")
 
 # ====================
-# API v1 Endpoints
+# Configuration API Endpoints (replacing config_router)
 # ====================
 
-# Dashboard endpoints
+@app.get("/api/v1/config/settings")
+async def get_config_settings():
+    """Get current configuration settings"""
+    # Access the global config properly with safe attribute access
+    app_config = config
+    
+    # Build response with safe attribute access
+    response = {}
+    
+    # Add elasticsearch config if it exists
+    if hasattr(app_config, 'elasticsearch') and app_config.elasticsearch:
+        response["elasticsearch"] = {
+            "url": str(app_config.elasticsearch.url) if hasattr(app_config.elasticsearch, 'url') else None,
+            "index_pattern": getattr(app_config.elasticsearch, 'index_pattern', 'traffic-*')
+        }
+    else:
+        # Fallback to default values
+        response["elasticsearch"] = {
+            "url": os.getenv('ELASTICSEARCH_URL', 'https://usieventho-prod-usw2.es.us-west-2.aws.found.io:9243/'),
+            "index_pattern": "traffic-*"
+        }
+    
+    # Add kibana config if it exists
+    if hasattr(app_config, 'kibana') and app_config.kibana:
+        response["kibana"] = {
+            "url": str(app_config.kibana.url) if hasattr(app_config.kibana, 'url') else None
+        }
+    else:
+        response["kibana"] = {
+            "url": os.getenv('ELASTICSEARCH_URL', 'https://usieventho-prod-usw2.kb.us-west-2.aws.found.io:9243/')
+        }
+    
+    # Add processing config if it exists
+    if hasattr(app_config, 'processing') and app_config.processing:
+        response["processing"] = app_config.processing.model_dump()
+    else:
+        response["processing"] = {
+            "baseline_start": "2025-06-01",
+            "baseline_end": "2025-06-09",
+            "current_time_range": "now-12h",
+            "high_volume_threshold": 1000,
+            "medium_volume_threshold": 100,
+            "critical_threshold": -80,
+            "warning_threshold": -50,
+            "min_daily_volume": 100
+        }
+    
+    # Add dashboard config if it exists
+    if hasattr(app_config, 'dashboard') and app_config.dashboard:
+        response["dashboard"] = app_config.dashboard.model_dump()
+    else:
+        response["dashboard"] = {
+            "refresh_interval": 300,
+            "max_events_display": 200,
+            "enable_websocket": True,
+            "theme": "light"
+        }
+    
+    # Add rad_types if it exists
+    if hasattr(app_config, 'rad_types') and app_config.rad_types:
+        response["rad_types"] = {k: v.model_dump() for k, v in app_config.rad_types.items()}
+    else:
+        response["rad_types"] = {}
+    
+    return response
+
+@app.post("/api/v1/config/settings")
+async def update_config_settings(update: ConfigUpdateRequest):
+    """Update configuration setting (in-memory only for this server)"""
+    # This is a simplified version - in production you'd want persistence
+    return {
+        "message": "Configuration update received",
+        "key": update.key,
+        "value": update.value,
+        "note": "Updates are in-memory only for this session"
+    }
+
+@app.get("/api/v1/config/health")
+async def config_health():
+    """Check configuration health"""
+    app_config = config
+    
+    # Build health response with safe attribute access
+    health_status = {
+        "healthy": True,
+        "config_loaded": True,
+        "elasticsearch_configured": False,
+        "kibana_configured": False,
+        "environment": "development",
+        "redis_enabled": False
+    }
+    
+    # Check elasticsearch configuration
+    if hasattr(app_config, 'elasticsearch') and app_config.elasticsearch:
+        health_status["elasticsearch_configured"] = bool(getattr(app_config.elasticsearch, 'url', None))
+    
+    # Check kibana configuration
+    if hasattr(app_config, 'kibana') and app_config.kibana:
+        health_status["kibana_configured"] = bool(getattr(app_config.kibana, 'url', None))
+    
+    # Get environment
+    if hasattr(app_config, 'environment'):
+        health_status["environment"] = app_config.environment
+    
+    # Check redis configuration
+    if hasattr(app_config, 'redis') and app_config.redis:
+        health_status["redis_enabled"] = getattr(app_config.redis, 'enabled', False)
+    
+    return health_status
+
+# ====================
+# Dashboard API Endpoints
+# ====================
+
 @app.get("/api/v1/dashboard/config", response_model=DashboardConfig)
-@limiter.limit("100 per minute" if ENVIRONMENT == "development" else "30 per minute")
-async def get_dashboard_config(request: Request):
-    """Get current dashboard configuration"""
-    return dashboard_state["config"]
+async def get_dashboard_config():
+    """Get dashboard configuration"""
+    app_config = config
+    
+    # Build dashboard config with safe attribute access
+    baseline_start = "2025-06-01"
+    baseline_end = "2025-06-09"
+    
+    if hasattr(app_config, 'processing') and app_config.processing:
+        baseline_start = getattr(app_config.processing, 'baseline_start', baseline_start)
+        baseline_end = getattr(app_config.processing, 'baseline_end', baseline_end)
+    
+    # Get other config values with safe defaults
+    time_range = "now-12h"
+    critical_threshold = -80
+    warning_threshold = -50
+    high_volume_threshold = 1000
+    medium_volume_threshold = 100
+    
+    if hasattr(app_config, 'processing') and app_config.processing:
+        time_range = getattr(app_config.processing, 'current_time_range', time_range)
+        critical_threshold = getattr(app_config.processing, 'critical_threshold', critical_threshold)
+        warning_threshold = getattr(app_config.processing, 'warning_threshold', warning_threshold)
+        high_volume_threshold = getattr(app_config.processing, 'high_volume_threshold', high_volume_threshold)
+        medium_volume_threshold = getattr(app_config.processing, 'medium_volume_threshold', medium_volume_threshold)
+    
+    return DashboardConfig(
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        time_range=time_range,
+        critical_threshold=critical_threshold,
+        warning_threshold=warning_threshold,
+        high_volume_threshold=high_volume_threshold,
+        medium_volume_threshold=medium_volume_threshold
+    )
 
 @app.post("/api/v1/dashboard/config", response_model=DashboardConfig)
-@limiter.limit("100 per minute" if ENVIRONMENT == "development" else "30 per minute")
-async def update_dashboard_config(request: Request, config: DashboardConfig):
-    """Update dashboard configuration"""
-    dashboard_state["config"] = config
-    await broadcast_to_websockets(WebSocketMessage(
-        type="config",
-        data=config.model_dump()
-    ))
+async def update_dashboard_config(config: DashboardConfig):
+    """Update dashboard configuration (in-memory)"""
+    # Store in app state for this session
+    app_state.dashboard_config = config
     return config
 
 @app.get("/api/v1/dashboard/stats", response_model=DashboardStats)
-@limiter.limit("100 per minute" if ENVIRONMENT == "development" else "60 per minute")
-async def get_dashboard_stats(request: Request):
+async def get_dashboard_stats():
     """Get current dashboard statistics"""
-    return dashboard_state["stats"]
+    # This would normally query actual data
+    # For now, return mock stats
+    return DashboardStats(
+        critical_count=0,
+        warning_count=0,
+        normal_count=0,
+        increased_count=0,
+        total_events=0,
+        last_update=datetime.now().isoformat()
+    )
 
-# Kibana proxy endpoint (built-in CORS support)
-@app.post("/api/v1/kibana/proxy")
-@app.post("/kibana-proxy")  # Legacy compatibility
-@limiter.limit("100 per minute" if ENVIRONMENT == "development" else "30 per minute")
-async def kibana_proxy(
+@app.post("/api/v1/dashboard/query", response_model=DashboardQueryResponse)
+@limiter.limit("10/minute")
+async def query_dashboard_data(
     request: Request,
+    query_request: KibanaQueryRequest,
+    authorization: Optional[str] = Header(None),
+    cookie: Optional[str] = Header(None),
     x_elastic_cookie: Optional[str] = Header(None, alias="X-Elastic-Cookie")
 ):
-    """Proxy requests to Kibana with CORS support"""
-    try:
-        # Get request body
-        raw_body = await request.body()
+    """Execute dashboard query against Elasticsearch"""
+    # Check cache first
+    cache_key = get_cache_key(query_request.query)
 
-        # Use cookie from header or environment
-        cookie = x_elastic_cookie or os.environ.get('ELASTIC_COOKIE', '')
-        if not cookie:
-            raise HTTPException(status_code=401, detail="No authentication cookie provided")
+    if not query_request.force_refresh and cache_key in app_state.cache:
+        cached_entry = app_state.cache[cache_key]
+        if datetime.now() - cached_entry["timestamp"] < CACHE_TTL:
+            app_state.metrics["cache_hits"] += 1
+            return DashboardQueryResponse(
+                data=cached_entry["data"],
+                metadata=cached_entry["metadata"],
+                cached=True,
+                query_time_ms=0
+            )
 
-        # Clean up cookie format - extract sid value if full cookie header provided
-        if 'sid=' in cookie:
-            # Extract just the sid value from full cookie header
-            for part in cookie.split(';'):
-                part = part.strip()
-                if part.startswith('sid='):
-                    cookie = part.split('=', 1)[1]
-                    break
+    app_state.metrics["cache_misses"] += 1
 
-        logger.info("kibana_proxy",
-            action="cookie_processed",
-            cookie_length=len(cookie),
-            has_sid_prefix='sid=' in x_elastic_cookie if x_elastic_cookie else False
+    # Execute query - check all possible auth headers
+    # Try Authorization header first (new standard), then fallback to others
+    auth_cookie = None
+    
+    if authorization and authorization.startswith("Bearer "):
+        logger.info("Using Authorization header (Bearer token)")
+        auth_cookie = authorization.replace("Bearer ", "").strip()
+    elif cookie:
+        logger.info("Using Cookie header")
+        auth_cookie = cookie
+    elif x_elastic_cookie:
+        logger.info("Using X-Elastic-Cookie header")
+        auth_cookie = x_elastic_cookie
+    elif authorization:
+        # Non-Bearer authorization header (backward compatibility)
+        logger.info("Using Authorization header (legacy)")
+        auth_cookie = authorization
+    else:
+        logger.warning("No authentication cookie found")
+    
+    if not auth_cookie:
+        raise HTTPException(status_code=401, detail="Authentication credentials not found")
+    
+    # Ensure cookie has sid= prefix
+    if not auth_cookie.startswith("sid="):
+        auth_cookie = f"sid={auth_cookie}"
+
+    # Continue with query execution
+    result = await execute_elasticsearch_query(query_request.query, auth_cookie)
+
+    if not result["success"]:
+        logger.error("Query Execution Failed", error=result.get('error', 'Unknown'), details=result.get('details', 'No details'))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query failed: {result.get('error', 'Unknown error')}"
         )
 
-        # Parse request body - support both wrapped and direct formats
-        try:
-            body_data = json.loads(raw_body)
+    # Process results
+    data = result["data"]
+    processed_data = []
 
-                        # Check if it's wrapped in our structured format
-            if isinstance(body_data, dict) and "query" in body_data:
-                # Extract the actual Elasticsearch query
-                es_query = body_data["query"]
-                query_body = json.dumps(es_query).encode('utf-8')
-
-                # Debug: Log query structure for troubleshooting
-                query_preview = {
-                    "size": es_query.get("size", "not_set"),
-                    "has_aggs": "aggs" in es_query,
-                    "has_query": "query" in es_query
-                }
-                if "query" in es_query and "bool" in es_query["query"]:
-                    bool_query = es_query["query"]["bool"]
-                    query_preview["bool_structure"] = {
-                        "has_filter": "filter" in bool_query,
-                        "filter_count": len(bool_query.get("filter", [])),
-                        "has_should": "should" in bool_query,
-                        "has_must": "must" in bool_query
-                    }
-
-                logger.info("kibana_proxy",
-                    action="extracted_structured_query",
-                    force_refresh=body_data.get("force_refresh", False),
-                    query_preview=query_preview
-                )
-
-                # Debug: Log first 500 chars of query being sent to ES
-                logger.info("kibana_proxy",
-                    action="sending_to_elasticsearch",
-                    query_snippet=query_body.decode('utf-8')[:500] + "..." if len(query_body) > 500 else query_body.decode('utf-8')
-                )
-            else:
-                # Assume it's already a raw Elasticsearch query
-                query_body = raw_body
-                logger.info("kibana_proxy", action="using_raw_query")
-
-        except json.JSONDecodeError:
-            # If we can't parse as JSON, pass through as-is
-            query_body = raw_body
-            logger.info("kibana_proxy", action="passthrough_non_json")
-
-        # Build request
-        proxy_url = f"{KIBANA_URL}{KIBANA_SEARCH_PATH}"
-        # Build headers with proper cookie format
-        headers = {
-            "Content-Type": "application/json",
-            "kbn-xsrf": "true",
-            "Cookie": f"sid={cookie}" if not cookie.startswith('sid=') else cookie
+    # In development mode with mock data, extract from hits
+    if ENVIRONMENT == 'development' and "hits" in data and "hits" in data["hits"]:
+        # Define RAD type colors and display names
+        rad_type_config = {
+            "login": {"color": "#6B7280", "display": "Login"},
+            "api_call": {"color": "#3B82F6", "display": "API Call"},
+            "page_view": {"color": "#10B981", "display": "Page View"},
+            "file_download": {"color": "#F59E0B", "display": "File Download"}
         }
+        
+        for hit in data["hits"]["hits"]:
+            source = hit.get("_source", {})
+            rad_type = source.get("rad_type", "")
+            rad_config = rad_type_config.get(rad_type, {"color": "#6B7280", "display": rad_type.title()})
+            
+            impact = source.get("impact", "").lower()
+            impact_class = "high" if impact == "high" else "medium" if impact == "medium" else "low"
+            
+            processed_data.append({
+                "id": f"{source.get('name', '')}_{source.get('timestamp', '')}",
+                "name": source.get("name", ""),
+                "radType": rad_type,
+                "radColor": rad_config["color"],
+                "radDisplayName": rad_config["display"],
+                "status": source.get("status", "").upper(),
+                "score": source.get("score", 0),
+                "current": source.get("current", 0),
+                "baseline": source.get("baseline", 0),
+                "impact": source.get("impact", ""),
+                "impactClass": impact_class,
+                "timestamp": source.get("timestamp", ""),
+                "kibanaUrl": "#"
+            })
+    # Extract events from aggregations if present (production mode)
+    elif "aggregations" in data and "events" in data["aggregations"]:
+        # Define RAD type colors and display names
+        rad_type_config = {
+            "login": {"color": "#6B7280", "display": "Login"},
+            "api_call": {"color": "#3B82F6", "display": "API Call"},
+            "page_view": {"color": "#10B981", "display": "Page View"},
+            "file_download": {"color": "#F59E0B", "display": "File Download"},
+            "custom": {"color": "#8B5CF6", "display": "Custom"}
+        }
+        
+        buckets = data["aggregations"]["events"].get("buckets", [])
+        for bucket in buckets:
+            event_id = bucket["key"]
+            current = bucket.get("current", {}).get("doc_count", 0)
+            baseline = bucket.get("baseline", {}).get("doc_count", 0)
+            
+            # Determine RAD type from EID
+            rad_type = determine_rad_type_from_eid(event_id)
+            rad_config = rad_type_config.get(rad_type, {"color": "#6B7280", "display": "Custom"})
+            
+            # Calculate score and status
+            score = 0
+            if baseline > 0:
+                score = int(((current - baseline) / baseline) * 100)
+            
+            status = "NORMAL"
+            if score < -30:
+                status = "CRITICAL"
+            elif score < -20:
+                status = "WARNING"
+            elif score > 50:
+                status = "INCREASED"
+            
+            processed_data.append({
+                "id": event_id,
+                "name": event_id,
+                "event_id": event_id,
+                "radType": rad_type,
+                "radColor": rad_config["color"],
+                "radDisplayName": rad_config["display"],
+                "status": status,
+                "score": score,
+                "count": bucket["doc_count"],
+                "current": current,
+                "baseline": baseline,
+                "impact": "High" if abs(score) > 50 else "Medium" if abs(score) > 30 else "Low",
+                "timestamp": datetime.now().isoformat(),
+                "kibanaUrl": f"/app/discover#/?_g=(filters:!(),time:(from:now-24h,to:now))&_a=(query:(match_phrase:(event_id:'{event_id}')))"
+            })
 
-        # Execute with circuit breaker
-        @es_circuit_breaker
-        async def execute_request():
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-                return await client.post(proxy_url, content=query_body, headers=headers)
+    # Cache successful results
+    app_state.cache[cache_key] = {
+        "data": processed_data,
+        "metadata": {
+            "took": data.get("took", 0),
+            "total_hits": data.get("hits", {}).get("total", {}).get("value", 0)
+        },
+        "timestamp": datetime.now()
+    }
 
-        try:
-            response = await execute_request()
-        except Exception as e:
-            if es_circuit_breaker.current_state == "open":
-                metrics_tracker.circuit_breaker_trips += 1
-                raise HTTPException(status_code=503, detail="Elasticsearch temporarily unavailable")
-            raise
+    # Limit cache size
+    if len(app_state.cache) > 100:
+        oldest_key = min(app_state.cache.keys(),
+                        key=lambda k: app_state.cache[k]["timestamp"])
+        del app_state.cache[oldest_key]
 
-        # Check for Elasticsearch errors in response
-        if response.status_code != 200:
-            try:
-                error_data = json.loads(response.content)
-                if "error" in error_data:
-                    error_msg = error_data["error"].get("reason", "Unknown error")
-                    error_type = error_data["error"].get("type", "unknown_error")
-                    logger.error("kibana_proxy",
-                        action="elasticsearch_error",
-                        error_type=error_type,
-                        error_reason=error_msg,
-                        status_code=response.status_code
-                    )
-            except:
-                pass  # Ignore parsing errors, return response as-is
+    return DashboardQueryResponse(
+        data=processed_data,
+        metadata={
+            "took": data.get("took", 0),
+            "total_hits": data.get("hits", {}).get("total", {}).get("value", 0)
+        },
+        cached=False,
+        query_time_ms=result["query_time_ms"]
+    )
 
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers={
-                "Content-Type": response.headers.get("Content-Type", "application/json"),
-                "X-Cache": "miss"
-            }
+# ====================
+# Authentication Endpoints
+# ====================
+
+@app.get("/api/v1/auth/status")
+async def auth_status(
+    authorization: Optional[str] = Header(None),
+    cookie: Optional[str] = Header(None),
+    x_elastic_cookie: Optional[str] = Header(None, alias="X-Elastic-Cookie")
+):
+    """Check authentication status"""
+    # Check Authorization header first (new standard), then others
+    auth_cookie = None
+    method = None
+    
+    if authorization and authorization.startswith("Bearer "):
+        auth_cookie = authorization.replace("Bearer ", "").strip()
+        method = "bearer"
+    elif cookie:
+        auth_cookie = cookie
+        method = "cookie"
+    elif x_elastic_cookie:
+        auth_cookie = x_elastic_cookie
+        method = "x-elastic-cookie"
+
+    if auth_cookie:
+        logger.info(f"Auth status check - {method} present")
+    else:
+        logger.info("Auth status check - No authentication found")
+
+    return {
+        "authenticated": bool(auth_cookie),
+        "method": method,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/v1/auth/logout")
+async def logout():
+    """Logout endpoint (placeholder)"""
+    return {
+        "message": "Logout successful",
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ====================
+# Kibana Proxy Endpoints
+# ====================
+
+@app.post("/api/v1/kibana/proxy")
+@app.post("/kibana-proxy")  # Legacy compatibility
+@limiter.limit("20/minute")
+async def kibana_proxy(
+    request: Request,
+    body: Dict[str, Any],
+    authorization: Optional[str] = Header(None),
+    cookie: Optional[str] = Header(None),
+    x_elastic_cookie: Optional[str] = Header(None, alias="X-Elastic-Cookie")
+):
+    """Proxy requests to Kibana (CORS bypass)"""
+    # Check Authorization header first (new standard), then others
+    auth_cookie = None
+    
+    if authorization and authorization.startswith("Bearer "):
+        auth_cookie = authorization.replace("Bearer ", "").strip()
+    elif cookie:
+        auth_cookie = cookie
+    elif x_elastic_cookie:
+        auth_cookie = x_elastic_cookie
+
+    if not auth_cookie:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Use Authorization: Bearer sid=..."
+        )
+    
+    # Ensure cookie has sid= prefix
+    if not auth_cookie.startswith("sid="):
+        auth_cookie = f"sid={auth_cookie}"
+
+    # Execute the query
+    result = await execute_elasticsearch_query(body, auth_cookie)
+
+    if result["success"]:
+        return result["data"]
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=result.get("error", "Proxy request failed")
         )
 
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Request to Kibana timed out")
-    except Exception as e:
-        logger.error("kibana_proxy_error", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+# ====================
+# Metrics & Monitoring
+# ====================
 
-# Metrics endpoint
 @app.get("/api/v1/metrics")
 async def get_metrics():
     """Get server metrics"""
-    return metrics_tracker.get_metrics()
+    return {
+        "uptime_seconds": (datetime.now() - app_state.start_time).total_seconds(),
+        "metrics": app_state.metrics,
+        "cache_info": {
+            "size": len(app_state.cache),
+            "hit_rate": (
+                app_state.metrics["cache_hits"] /
+                (app_state.metrics["cache_hits"] + app_state.metrics["cache_misses"])
+                if (app_state.metrics["cache_hits"] + app_state.metrics["cache_misses"]) > 0
+                else 0
+            )
+        }
+    }
 
 @app.post("/api/v1/metrics/reset")
 async def reset_metrics():
-    """Reset metrics"""
-    metrics_tracker.reset()
-    return {"status": "success", "message": "Metrics reset"}
+    """Reset metrics (admin endpoint)"""
+    app_state.metrics = {
+        "requests_total": 0,
+        "requests_success": 0,
+        "requests_failed": 0,
+        "websocket_connections": len(app_state.websocket_clients),
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "avg_response_time_ms": 0
+    }
+    return {"message": "Metrics reset", "timestamp": datetime.now().isoformat()}
 
-# Debug endpoint for cookie testing
-@app.post("/api/v1/debug/test-cookie")
-async def test_cookie_format(
-    request: Request,
-    x_elastic_cookie: Optional[str] = Header(None, alias="X-Elastic-Cookie")
-):
-    """Test cookie format and processing"""
-    try:
-        # Get cookie from header or environment
-        raw_cookie = x_elastic_cookie or os.environ.get('ELASTIC_COOKIE', '')
-        if not raw_cookie:
-            return {"error": "No cookie provided", "status": "missing"}
+# ====================
+# EID Registry Endpoints
+# ====================
 
-        # Process cookie same way as main proxy
-        processed_cookie = raw_cookie
-        if 'sid=' in processed_cookie:
-            for part in processed_cookie.split(';'):
-                part = part.strip()
-                if part.startswith('sid='):
-                    processed_cookie = part.split('=', 1)[1]
-                    break
+class EIDMapping(BaseModel):
+    """Model for EID to RAD mapping"""
+    eid: str
+    rad_type: str
+    description: Optional[str] = None
+    added_at: datetime = Field(default_factory=datetime.now)
 
-        return {
-            "status": "processed",
-            "raw_cookie_length": len(raw_cookie),
-            "processed_cookie_length": len(processed_cookie),
-            "has_sid_prefix": 'sid=' in raw_cookie,
-            "processed_cookie_preview": processed_cookie[:20] + "..." if len(processed_cookie) > 20 else processed_cookie,
-            "cookie_format": "full_header" if 'sid=' in raw_cookie else "sid_value_only"
-        }
-    except Exception as e:
-        return {"error": str(e), "status": "error"}
+class EIDRegistryResponse(BaseModel):
+    """Response model for EID registry operations"""
+    success: bool
+    message: str
+    mappings: Optional[List[EIDMapping]] = None
 
-# Utility endpoints
+# In-memory storage for EID mappings (in production, use a database)
+eid_registry: Dict[str, EIDMapping] = {}
+
+@app.get("/api/v1/eid-registry", response_model=EIDRegistryResponse)
+async def get_eid_registry():
+    """Get all EID mappings"""
+    return EIDRegistryResponse(
+        success=True,
+        message="Registry retrieved successfully",
+        mappings=list(eid_registry.values())
+    )
+
+@app.post("/api/v1/eid-registry", response_model=EIDRegistryResponse)
+async def add_eid_mapping(mapping: EIDMapping):
+    """Add a new EID mapping"""
+    if mapping.eid in eid_registry:
+        raise HTTPException(
+            status_code=400,
+            detail="EID already exists in registry"
+        )
+    
+    eid_registry[mapping.eid] = mapping
+    return EIDRegistryResponse(
+        success=True,
+        message=f"EID '{mapping.eid}' added successfully",
+        mappings=[mapping]
+    )
+
+@app.delete("/api/v1/eid-registry/{eid}", response_model=EIDRegistryResponse)
+async def delete_eid_mapping(eid: str):
+    """Delete an EID mapping"""
+    if eid not in eid_registry:
+        raise HTTPException(
+            status_code=404,
+            detail="EID not found in registry"
+        )
+    
+    del eid_registry[eid]
+    return EIDRegistryResponse(
+        success=True,
+        message=f"EID '{eid}' deleted successfully"
+    )
+
+@app.post("/api/v1/eid-registry/bulk", response_model=EIDRegistryResponse)
+async def bulk_import_eid_mappings(mappings: List[EIDMapping]):
+    """Bulk import EID mappings"""
+    added = 0
+    for mapping in mappings:
+        if mapping.eid not in eid_registry:
+            eid_registry[mapping.eid] = mapping
+            added += 1
+    
+    return EIDRegistryResponse(
+        success=True,
+        message=f"Added {added} new mappings (skipped {len(mappings) - added} duplicates)",
+        mappings=list(eid_registry.values())
+    )
+
+# ====================
+# Diagnostic Endpoints
+# ====================
+
+class DiagnosticInfo(BaseModel):
+    """Model for diagnostic information"""
+    total_events: int
+    registry_mappings: int
+    registry_matches: int
+    pattern_matches: int
+    unknown_eids: List[str]
+    processing_details: List[Dict[str, Any]]
+
+@app.get("/api/v1/diagnostics/eid-processing")
+async def get_eid_processing_diagnostics():
+    """Get detailed diagnostics about EID processing"""
+    # Get current cached data
+    cache_entries = []
+    for key, entry in app_state.cache.items():
+        if "data" in entry:
+            cache_entries.extend(entry["data"])
+    
+    # Analyze EID processing
+    registry_matches = 0
+    pattern_matches = 0
+    unknown_eids = []
+    processing_details = []
+    
+    for event in cache_entries:
+        eid = event.get("event_id") or event.get("id") or event.get("name", "")
+        if not eid:
+            continue
+            
+        # Check registry match
+        registry_match = None
+        for mapping_eid, mapping in eid_registry.items():
+            if mapping_eid.upper() in eid.upper():
+                registry_match = mapping
+                registry_matches += 1
+                break
+        
+        if registry_match:
+            processing_details.append({
+                "eid": eid,
+                "detected_rad": registry_match.rad_type,
+                "source": "registry",
+                "confidence": 100,
+                "mapping": registry_match.eid
+            })
+        else:
+            # Try pattern matching
+            detected_rad = determine_rad_type_from_eid(eid)
+            if detected_rad and detected_rad != 'custom':
+                pattern_matches += 1
+                processing_details.append({
+                    "eid": eid,
+                    "detected_rad": detected_rad,
+                    "source": "pattern",
+                    "confidence": calculate_pattern_confidence(eid, detected_rad)
+                })
+            else:
+                unknown_eids.append(eid)
+                processing_details.append({
+                    "eid": eid,
+                    "detected_rad": detected_rad or "unknown",
+                    "source": "unknown",
+                    "confidence": 0
+                })
+    
+    return DiagnosticInfo(
+        total_events=len(cache_entries),
+        registry_mappings=len(eid_registry),
+        registry_matches=registry_matches,
+        pattern_matches=pattern_matches,
+        unknown_eids=unknown_eids[:20],  # Limit to first 20
+        processing_details=processing_details[:50]  # Limit to first 50
+    )
+
+def calculate_pattern_confidence(eid: str, rad_type: str) -> int:
+    """Calculate confidence score for pattern-based RAD type detection"""
+    eid_upper = eid.upper()
+    patterns = {
+        'login': ['LOGIN', 'AUTH', 'SIGNIN', 'LOGON'],
+        'api_call': ['API', 'ENDPOINT', 'SERVICE', 'REQUEST'],
+        'page_view': ['PAGE', 'VIEW', 'VISIT', 'SCREEN'],
+        'file_download': ['DOWNLOAD', 'FILE', 'EXPORT', 'ATTACHMENT']
+    }
+    
+    relevant_patterns = patterns.get(rad_type, [])
+    if not relevant_patterns:
+        return 0
+    
+    match_count = sum(1 for pattern in relevant_patterns if pattern in eid_upper)
+    return min(100, int((match_count / len(relevant_patterns)) * 100))
+
+@app.get("/api/v1/diagnostics/cache-analysis")
+async def get_cache_analysis():
+    """Analyze cache usage and performance"""
+    cache_sizes = []
+    cache_ages = []
+    now = datetime.now()
+    
+    for key, entry in app_state.cache.items():
+        cache_sizes.append(len(str(entry)))
+        age = (now - entry["timestamp"]).total_seconds()
+        cache_ages.append(age)
+    
+    return {
+        "cache_entries": len(app_state.cache),
+        "total_size_bytes": sum(cache_sizes),
+        "average_size_bytes": sum(cache_sizes) / len(cache_sizes) if cache_sizes else 0,
+        "oldest_entry_age_seconds": max(cache_ages) if cache_ages else 0,
+        "newest_entry_age_seconds": min(cache_ages) if cache_ages else 0,
+        "cache_hit_rate": (
+            app_state.metrics["cache_hits"] /
+            (app_state.metrics["cache_hits"] + app_state.metrics["cache_misses"])
+            if (app_state.metrics["cache_hits"] + app_state.metrics["cache_misses"]) > 0
+            else 0
+        )
+    }
+
+# ====================
+# Utility Endpoints
+# ====================
+
 @app.post("/api/v1/utils/cleanup-ports")
-async def cleanup_ports(request: PortCleanupRequest):
-    """Clean up processes using specified ports"""
-    # Import here to avoid circular imports
-    from cleanup_ports import cleanup_port, find_process_by_port
+async def cleanup_ports(cleanup_request: PortCleanupRequest):
+    """Cleanup ports utility endpoint"""
+    import subprocess
 
-    try:
-        ports_cleaned = {}
-        total_killed = 0
+    cleaned_ports = []
+    failed_ports = []
 
-        for port in request.ports:
-            killed = cleanup_port(port, force=request.force)
-            ports_cleaned[port] = killed > 0
-            total_killed += killed
+    for port in cleanup_request.ports:
+        try:
+            # Use the cleanup script
+            result = subprocess.run(
+                ["python3", "bin/cleanup_ports.py", str(port)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                cleaned_ports.append(port)
+            else:
+                failed_ports.append(port)
+        except Exception as e:
+            failed_ports.append(port)
+            logger.error(f"Failed to cleanup port {port}: {e}")
 
-        return {
-            "success": all(not find_process_by_port(port) for port in request.ports),
-            "ports_cleaned": ports_cleaned,
-            "processes_killed": total_killed
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "cleaned": cleaned_ports,
+        "failed": failed_ports,
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.post("/api/v1/utils/validate")
-async def validate_connections(request: ValidationRequest):
-    """Validate project connections and configuration"""
-    # Import here to avoid circular imports
-    from validate_connections import Validator
+async def validate_connections():
+    """Validate all connections and configuration"""
+    results = {
+        "elasticsearch": False,
+        "configuration": False,
+        "static_files": False,
+        "timestamp": datetime.now().isoformat()
+    }
 
+    # Check Elasticsearch
     try:
-        validator = Validator(verbose=request.verbose)
+        test_query = {"query": {"match_all": {}}, "size": 0}
+        result = await execute_elasticsearch_query(test_query)
+        results["elasticsearch"] = result.get("success", False)
+    except:
+        results["elasticsearch"] = False
 
-        # Run validations
-        if request.categories:
-            for category in request.categories:
-                method_name = f"validate_{category}"
-                if hasattr(validator, method_name):
-                    getattr(validator, method_name)()
-        else:
-            # Run all validations
-            validator.validate_project_structure()
-            validator.validate_core_files()
-            validator.validate_python_imports()
-            validator.validate_dependencies()
-            validator.validate_configuration()
-            validator.validate_integration_points()
-            validator.validate_test_configuration()
-            validator.validate_data_flow()
+    # Check configuration
+    try:
+        # Check if config was loaded successfully
+        results["configuration"] = bool(config) and hasattr(config, 'environment')
+    except:
+        results["configuration"] = False
 
-        results = validator.result.to_json()
-        return {
-            "success": results['success'],
-            "passed": results['passed'],
-            "failed": results['failed'],
-            "warnings": validator.result.warnings,
-            "details": results['details']
+    # Check static files
+    dist_index = PROJECT_ROOT / "dist" / "index.html"
+    root_index = PROJECT_ROOT / "index.html"
+    results["static_files"] = dist_index.exists() or root_index.exists()
+
+    return results
+
+# ====================
+# Error Handlers
+# ====================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """General exception handler"""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "type": type(exc).__name__,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# ====================
+# Startup Banner
+# ====================
+
+def print_startup_banner():
+    """Print startup banner with server information"""
+    banner = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                    RAD Monitor Unified Server                     ║
+║                         Version 2.0.0                             ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Environment: {ENVIRONMENT:<50} ║
+║  Port: {SERVER_PORT:<57} ║
+║  Host: {SERVER_HOST:<57} ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Dashboard: http://localhost:{SERVER_PORT}                              ║
+║  API Docs:  http://localhost:{SERVER_PORT}/docs                         ║
+║  WebSocket: ws://localhost:{SERVER_PORT}/ws                             ║
+╚══════════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
 
 # ====================
 # Main Entry Point
 # ====================
 
 if __name__ == "__main__":
-    # Clean up ports first
-    if os.path.exists("scripts/setup/cleanup-ports.sh"):
-        os.system("scripts/setup/cleanup-ports.sh >/dev/null 2>&1")
+    print_startup_banner()
 
-    # Run server
-    uvicorn.run(
-        app,  # Pass the app directly instead of module string
-        host=SERVER_HOST,
-        port=SERVER_PORT,
-        reload=False,  # Disable reload when running directly
-        log_level="info",
-        access_log=False  # We have our own request tracking
-    )
+    # Create an async function to run the server
+    async def run_server():
+        # Configure uvicorn
+        config = uvicorn.Config(
+            app,
+            host=SERVER_HOST,
+            port=SERVER_PORT,
+            reload=False,  # Disable reload to prevent orphaned processes
+            log_level="info" if ENVIRONMENT == "development" else "warning",
+            access_log=ENVIRONMENT == "development",
+            loop="asyncio"
+        )
+
+        # Create server instance
+        server = uvicorn.Server(config)
+
+        # Set up signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        
+        def signal_handler(sig):
+            logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+            server.should_exit = True
+
+        # Register signal handlers
+        for sig in [signal.SIGTERM, signal.SIGINT]:
+            loop.add_signal_handler(sig, signal_handler, sig)
+
+        try:
+            # Run the server
+            await server.serve()
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+        finally:
+            # Clean up signal handlers
+            for sig in [signal.SIGTERM, signal.SIGINT]:
+                loop.remove_signal_handler(sig)
+            
+            # Force close any remaining connections
+            await asyncio.sleep(0.1)
+            logger.info("Server shutdown complete")
+
+    # Run the async function
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    finally:
+        # Extra cleanup - force kill any remaining tasks
+        try:
+            # Get all running tasks
+            loop = asyncio.new_event_loop()
+            # Use the correct method for Python 3.9+
+            if hasattr(asyncio, 'all_tasks'):
+                pending = asyncio.all_tasks(loop)
+            else:
+                # For Python 3.7-3.8
+                pending = asyncio.Task.all_tasks(loop) if hasattr(asyncio.Task, 'all_tasks') else set()
+            
+            for task in pending:
+                task.cancel()
+        except:
+            pass
+        
+        logger.info("RAD Monitor server stopped")

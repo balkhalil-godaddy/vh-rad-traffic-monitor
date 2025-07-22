@@ -5,11 +5,13 @@
 
 import { ConfigService } from './config-service.js';
 import TimeRangeUtils from './time-range-utils.js';
+import DOMPurify from './lib/dompurify.js';
+import { authManager } from './auth-manager.js';
 
 const ConfigEditor = {
     // Store current config for comparison
     currentConfig: null,
-    
+
     // Initialize the editor
     async init() {
         // Initialize API if not already done
@@ -17,64 +19,64 @@ const ConfigEditor = {
             await API.initialize();
         }
     },
-    
+
     // Load current configuration
     async loadConfig() {
         const statusEl = document.getElementById('configEditorStatus');
         const fieldsEl = document.getElementById('configEditorFields');
-        
+
         try {
             statusEl.textContent = 'Loading configuration...';
-            
+
             // Get config from ConfigService
             this.currentConfig = await ConfigService.getConfig();
-            
+
             // Build the editor fields
-            fieldsEl.innerHTML = this.buildEditorFields(this.currentConfig);
-            
-            statusEl.textContent = '✓ Configuration loaded';
+            fieldsEl.innerHTML = DOMPurify.sanitize(this.buildEditorFields(this.currentConfig));
+
+            statusEl.textContent = '(✓) Configuration loaded';
             statusEl.style.color = '#28a745';
-            
+
             console.log('Config loaded:', this.currentConfig);
-            
+
             // Update query preview
             this.updateQueryPreview();
-            
+
             // Add event listeners for real-time updates
             this.attachEventListeners();
         } catch (error) {
-            statusEl.textContent = '✗ Error loading config: ' + error.message;
+            statusEl.textContent = '(✗)Error loading config: ' + error.message;
             statusEl.style.color = '#dc3545';
             console.error('Error loading config:', error);
         }
     },
-    
+
     // Build editor fields HTML
     buildEditorFields(config) {
         let html = '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">';
-        
+
         // Left Column
         html += '<div>';
-        
+
         // Time Range Settings
         html += '<div class="config-section">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">⏰ Time Range</h5>';
         html += this.createCompactField('Current Range', 'timeRange.current', config.currentTimeRange || 'now-12h', 'text');
         html += '<div style="margin: 5px 0; display: flex; gap: 5px; flex-wrap: wrap;">';
-        html += '<button class="preset-button" onclick="ConfigEditor.setTimeRange(\'now-6h\')" style="flex: 1; min-width: 40px; padding: 4px; font-size: 11px;">6H</button>';
-        html += '<button class="preset-button" onclick="ConfigEditor.setTimeRange(\'now-12h\')" style="flex: 1; min-width: 40px; padding: 4px; font-size: 11px;">12H</button>';
-        html += '<button class="preset-button" onclick="ConfigEditor.setTimeRange(\'now-24h\')" style="flex: 1; min-width: 40px; padding: 4px; font-size: 11px;">24H</button>';
-        html += '<button class="preset-button" onclick="ConfigEditor.setTimeRange(\'now-3d\')" style="flex: 1; min-width: 40px; padding: 4px; font-size: 11px;">3D</button>';
+                    html += '<button class="ux-button ux-button--tertiary" onclick="ConfigEditor.setTimeRange(\'now-6h\')" style="flex: 1; min-width: 40px; padding: 4px 8px; font-size: 11px;">6H</button>';
+            html += '<button class="ux-button ux-button--tertiary" onclick="ConfigEditor.setTimeRange(\'now-12h\')" style="flex: 1; min-width: 40px; padding: 4px 8px; font-size: 11px;">12H</button>';
+            html += '<button class="ux-button ux-button--tertiary" onclick="ConfigEditor.setTimeRange(\'now-24h\')" style="flex: 1; min-width: 40px; padding: 4px 8px; font-size: 11px;">24H</button>';
+            html += '<button class="ux-button ux-button--tertiary" onclick="ConfigEditor.setTimeRange(\'now-3d\')" style="flex: 1; min-width: 40px; padding: 4px 8px; font-size: 11px;">3D</button>';
         html += '</div>';
         html += '</div>';
-        
+
         // Baseline Period
         html += '<div class="config-section" style="margin-top: 12px;">';
-        html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">📊 Baseline Period</h5>';
+        html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;"> Baseline Period</h5>';
         html += this.createCompactField('Start Date', 'timeRange.baselineStart', config.baselineStart || '2025-06-01', 'date');
         html += this.createCompactField('End Date', 'timeRange.baselineEnd', config.baselineEnd || '2025-06-09', 'date');
         html += '</div>';
-        
+
         // Volume Thresholds
         html += '<div class="config-section" style="margin-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">📈 Volume Thresholds</h5>';
@@ -84,12 +86,12 @@ const ConfigEditor = {
         html += '</div>';
         html += this.createCompactField('Min Daily Volume', 'processing.minDailyVolume', config.minDailyVolume || 100, 'number');
         html += '</div>';
-        
+
         html += '</div>'; // End left column
-        
+
         // Right Column
         html += '<div>';
-        
+
         // Alert Thresholds
         html += '<div class="config-section">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">🚨 Alert Thresholds</h5>';
@@ -98,7 +100,7 @@ const ConfigEditor = {
         html += this.createCompactField('Warning', 'processing.warningThreshold', config.warningThreshold || -50, 'number', '%');
         html += '</div>';
         html += '</div>';
-        
+
         // Dashboard Settings
         html += '<div class="config-section" style="margin-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">🎨 Dashboard</h5>';
@@ -109,7 +111,7 @@ const ConfigEditor = {
         html += this.createCompactField('Max Events', 'dashboard.maxEventsDisplay', config.maxEventsDisplay || 200, 'number');
         html += '</div>';
         html += '</div>';
-        
+
         // Elasticsearch Settings
         html += '<div class="config-section" style="margin-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">🔍 Elasticsearch/Kibana</h5>';
@@ -117,10 +119,10 @@ const ConfigEditor = {
         html += this.createCompactField('Index Pattern', 'elasticsearch.indexPattern', config.indexPattern || 'traffic-*', 'text');
         html += this.createCompactField('Auth Cookie', 'elasticsearch.cookie', config.elasticCookie || '', 'text', '', 'password');
         html += '</div>';
-        
+
         html += '</div>'; // End right column
         html += '</div>'; // End grid
-        
+
         // Query Configuration Section
         html += '<div class="config-section" style="margin-top: 12px; border-top: 1px solid #eee; padding-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">🎯 Query Configuration</h5>';
@@ -133,7 +135,7 @@ const ConfigEditor = {
         html += '</div>';
         html += '</div>';
         html += '</div>';
-        
+
         // Query Preview Section
         html += '<div class="config-section" style="margin-top: 12px; border-top: 1px solid #eee; padding-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">🔍 Query Preview</h5>';
@@ -143,7 +145,7 @@ const ConfigEditor = {
         html += '</div>';
         html += '<pre id="queryPreview" style="background: #f5f5f5; padding: 10px; border-radius: 4px; font-size: 11px; overflow-x: auto; max-height: 300px; overflow-y: auto; margin: 0;"></pre>';
         html += '</div>';
-        
+
         // Additional settings in full width
         html += '<div class="config-section" style="margin-top: 12px; border-top: 1px solid #eee; padding-top: 12px;">';
         html += '<h5 style="margin: 0 0 8px 0; font-size: 13px; color: #555;">📅 Advanced Settings</h5>';
@@ -160,16 +162,16 @@ const ConfigEditor = {
         html += '</div>';
         html += '</div>';
         html += '</div>';
-        
+
         return html;
     },
-    
+
     // Create a single field
     createField(label, path, value, type = 'text', options = []) {
         const fieldId = 'config_' + path.replace(/\./g, '_');
         let html = '<div class="config-field" style="margin-bottom: 10px;">';
         html += `<label for="${fieldId}" style="display: block; font-size: 12px; margin-bottom: 3px;">${label}:</label>`;
-        
+
         if (type === 'select') {
             html += `<select id="${fieldId}" data-path="${path}" class="config-input" style="width: 100%; padding: 5px;">`;
             options.forEach(opt => {
@@ -179,16 +181,16 @@ const ConfigEditor = {
         } else {
             html += `<input type="${type}" id="${fieldId}" data-path="${path}" value="${value}" class="config-input" style="width: 100%; padding: 5px;">`;
         }
-        
+
         html += '</div>';
         return html;
     },
-    
+
     // Create a compact field for the consolidated view
     createCompactField(label, path, value, type = 'text', optionsOrSuffix = '', inputType = null) {
         const fieldId = 'config_' + path.replace(/\./g, '_');
         let html = '<div class="config-field-compact" style="margin-bottom: 6px;">';
-        
+
         if (type === 'select') {
             html += `<label for="${fieldId}" style="display: block; font-size: 11px; margin-bottom: 2px; color: #666;">${label}:</label>`;
             html += `<select id="${fieldId}" data-path="${path}" class="config-input" style="width: 100%; padding: 4px; font-size: 12px;">`;
@@ -202,11 +204,11 @@ const ConfigEditor = {
             const actualType = inputType || type;
             html += `<input type="${actualType}" id="${fieldId}" data-path="${path}" value="${value}" class="config-input" style="width: 100%; padding: 4px; font-size: 12px;">`;
         }
-        
+
         html += '</div>';
         return html;
     },
-    
+
     // Set time range helper
     setTimeRange(range) {
         const input = document.getElementById('config_timeRange_current');
@@ -223,7 +225,7 @@ const ConfigEditor = {
             });
         }
     },
-    
+
     // Map nested path to ConfigService flat keys
     mapToConfigKey(section, key) {
         const mapping = {
@@ -252,28 +254,28 @@ const ConfigEditor = {
             'query.eventPattern': 'queryEventPattern',
             'query.aggSize': 'queryAggSize'
         };
-        
+
         const fullPath = `${section}.${key}`;
         return mapping[fullPath] || null;
     },
-    
+
     // Save configuration
     async saveConfig() {
         const statusEl = document.getElementById('configEditorStatus');
-        
+
         try {
             statusEl.textContent = 'Saving configuration...';
             statusEl.style.color = '#666';
-            
-            
+
+
             // Collect all changes
             const flatConfig = {};
             const inputs = document.querySelectorAll('#configEditorFields .config-input');
-            
+
             inputs.forEach(input => {
                 const path = input.dataset.path;
                 let value = input.value;
-                
+
                 // Convert to appropriate type
                 if (input.type === 'number') {
                     value = parseInt(value, 10);
@@ -284,7 +286,7 @@ const ConfigEditor = {
                     // Convert datetime-local to ISO string
                     value = value ? new Date(value).toISOString() : '';
                 }
-                
+
                 // Convert nested path to flat config key
                 const pathParts = path.split('.');
                 if (pathParts.length === 2) {
@@ -305,39 +307,41 @@ const ConfigEditor = {
                     }
                 }
             });
-            
+
             // Update configuration using ConfigService - save locally only for now
             await ConfigService.updateConfig(flatConfig, { saveToBackend: false, saveToLocalStorage: true });
-            
+
             // If elastic cookie was updated, test the connection immediately
             if (flatConfig.elasticCookie) {
-                statusEl.textContent = '✓ Cookie saved! Testing connection...';
+                statusEl.textContent = '(✓) Cookie saved! Testing connection...';
                 statusEl.style.color = '#17a2b8';
-                
+
                 // Save cookie to localStorage in the format expected by the API client
                 const cookieData = {
                     cookie: flatConfig.elasticCookie,
-                    expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-                    saved: new Date().toISOString()
-                };
-                localStorage.setItem('elasticCookie', JSON.stringify(cookieData));
-                
+                                    expires: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                saved: new Date().toISOString()
+            };
+
+            // Use AuthManager to set cookie
+            authManager.setCookie(cookieValue);
+
                 // Test the connection using the unified API
                 try {
                     // Import the unified API client
                     const { unifiedAPI } = await import('./api-interface.js');
-                    
+
                     // Test authentication
                     const authResult = await unifiedAPI.getAuthenticationDetails();
-                    
+
                     if (authResult.valid) {
                         // Try a simple health check query
                         const testResult = await unifiedAPI.checkHealth();
-                        
+
                         if (testResult) {
-                            statusEl.textContent = '✓ Configuration saved & connection verified!';
+                            statusEl.textContent = '(✓) Configuration saved & connection verified!';
                             statusEl.style.color = '#28a745';
-                            
+
                             // Refresh dashboard after successful save
                             if (typeof Dashboard !== 'undefined' && Dashboard.refresh) {
                                 setTimeout(() => {
@@ -362,9 +366,9 @@ const ConfigEditor = {
                 }
             } else {
                 // No cookie change, just save normally
-                statusEl.textContent = '✓ Configuration saved successfully!';
+                statusEl.textContent = '(✓) Configuration saved successfully!';
                 statusEl.style.color = '#28a745';
-                
+
                 // Notify other parts of the app
                 if (typeof Dashboard !== 'undefined' && Dashboard.refresh) {
                     setTimeout(() => {
@@ -376,42 +380,42 @@ const ConfigEditor = {
                     }, 1000);
                 }
             }
-            
+
         } catch (error) {
-            statusEl.textContent = '✗ Error saving config: ' + error.message;
+            statusEl.textContent = '(✗)Error saving config: ' + error.message;
             statusEl.style.color = '#dc3545';
             console.error('Error saving config:', error);
         }
     },
-    
+
     // Reset to defaults
     async resetToDefaults() {
         const statusEl = document.getElementById('configEditorStatus');
-        
+
         if (!confirm('Are you sure you want to reset all settings to defaults? This cannot be undone.')) {
             return;
         }
-        
+
         try {
             statusEl.textContent = 'Resetting to defaults...';
             statusEl.style.color = '#666';
-            
+
             // Reset using ConfigService method
             await ConfigService.resetToDefaults();
-            
+
             // Reload the editor
             await this.loadConfig();
-            
-            statusEl.textContent = '✓ Reset to defaults complete!';
+
+            statusEl.textContent = '(✓) Reset to defaults complete!';
             statusEl.style.color = '#28a745';
-            
+
         } catch (error) {
-            statusEl.textContent = '✗ Error resetting config: ' + error.message;
+            statusEl.textContent = '(✗)Error resetting config: ' + error.message;
             statusEl.style.color = '#dc3545';
             console.error('Error resetting config:', error);
         }
     },
-    
+
     // Generate Elasticsearch query based on current form values
     generateQuery() {
         // Get current values from form
@@ -419,7 +423,7 @@ const ConfigEditor = {
             const el = document.getElementById(id);
             return el ? el.value : '';
         };
-        
+
         const currentTimeRange = getValue('config_timeRange_current') || 'now-12h';
         const baselineStart = getValue('config_timeRange_baselineStart') || '2025-06-01';
         const baselineEnd = getValue('config_timeRange_baselineEnd') || '2025-06-09';
@@ -427,17 +431,17 @@ const ConfigEditor = {
         const indexPattern = getValue('config_elasticsearch_indexPattern') || 'traffic-*';
         const eventPattern = getValue('config_query_eventPattern') || 'pandc.vnext.recommendations.feed.feed*';
         const aggSize = parseInt(getValue('config_query_aggSize') || '500', 10);
-        
+
         // Fixed values
         const hostFilter = 'dashboard.godaddy.com';
         const eventField = 'detail.event.data.traffic.eid.keyword';
-        
+
         // Convert datetime-local to ISO format for minEventDate
         const minEventDateISO = minEventDate ? new Date(minEventDate).toISOString() : '2025-05-19T04:00:00.000Z';
-        
+
         // Parse current time range
         const currentTimeFilter = TimeRangeUtils.parseTimeRangeToFilter(currentTimeRange);
-        
+
         // Build the query
         const query = {
             index: indexPattern,
@@ -499,15 +503,15 @@ const ConfigEditor = {
                 }
             }
         };
-        
+
         return query;
     },
-    
+
     // Update query preview
     updateQueryPreview() {
         const previewEl = document.getElementById('queryPreview');
         if (!previewEl) return;
-        
+
         try {
             const query = this.generateQuery();
             previewEl.textContent = JSON.stringify(query, null, 2);
@@ -515,11 +519,11 @@ const ConfigEditor = {
             previewEl.textContent = `Error generating query: ${error.message}`;
         }
     },
-    
+
     // Attach event listeners for real-time updates
     attachEventListeners() {
         const inputs = document.querySelectorAll('#configEditorFields .config-input');
-        
+
         // Debounce function to avoid too many updates
         let updateTimeout;
         const debouncedUpdate = () => {
@@ -528,13 +532,13 @@ const ConfigEditor = {
                 this.updateQueryPreview();
             }, 300);
         };
-        
+
         inputs.forEach(input => {
             // Update on input change
             input.addEventListener('input', debouncedUpdate);
             input.addEventListener('change', debouncedUpdate);
         });
-        
+
         // Also update when preset time range buttons are clicked
         setTimeout(() => {
             const presetButtons = document.querySelectorAll('.preset-button');
@@ -545,23 +549,23 @@ const ConfigEditor = {
             });
         }, 100);
     },
-    
+
     // Copy query to clipboard
     async copyQuery(evt) {
         const previewEl = document.getElementById('queryPreview');
         if (!previewEl) return;
-        
+
         try {
             await navigator.clipboard.writeText(previewEl.textContent);
-            
+
             // Show feedback
             const button = evt ? evt.target : document.querySelector('[onclick*="copyQuery"]');
             if (button) {
                 const originalText = button.textContent;
-                button.textContent = '✓ Copied!';
+                button.textContent = '(✓) Copied!';
                 button.style.background = '#4CAF50';
                 button.style.color = 'white';
-                
+
                 setTimeout(() => {
                     button.textContent = originalText;
                     button.style.background = '#f0f0f0';
