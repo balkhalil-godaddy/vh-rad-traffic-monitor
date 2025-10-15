@@ -12,7 +12,7 @@ Just need to monitor traffic? Go to the URL above, enter your Kibana cookie when
 
 ```mermaid
 graph LR
-    A[Dashboard<br/>GitHub Pages] -->|HTTPS| B[Proxy<br/>Netlify Function]
+    A[Dashboard<br/>GitHub Pages] -->|HTTPS| B[Proxy<br/> Function]
     B -->|Authenticated| C[Kibana API]
     C -->|Query| D[Elasticsearch<br/>traffic-* indices]
 
